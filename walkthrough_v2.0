@@ -1,0 +1,76 @@
+# 3D装箱系统优化 — 变更总结
+
+## 修改的文件
+
+### 1. [config.py](file:///d:/Code/robot_packing/config.py)
+
+**新增配置项：**
+- `PLY_FILE_PATH` — PLY 文件路径
+- `XY_ONLY_ROTATION` — 仅XY旋转开关
+- `OUTER_HEIGHT_TOLERANCE = 0.05` — 外侧高度约束阈值（5cm）
+- `OUTER_HEIGHT_CHECK_RATIO = 0.67` — 违规列占比阈值（2/3）
+- `WEIGHT_LOW` 从 8.0 提升到 12.0（强化从下往上优先）
+- 新增评分权重：`WEIGHT_SURFACE_FLAT`, `WEIGHT_LAYER_COMPLETE`, `WEIGHT_VOID_PENALTY`, `WEIGHT_STEP_PROFILE`
+
+**修改 `get_orientations()`：** 新增 `xy_only` 参数
+- `xy_only=True` → 只返回2种朝向（自然放置 + 绕Z轴90°）
+- `xy_only=False` → 保持原来6种朝向
+
+---
+
+### 2. [point_cloud_processor.py](file:///d:/Code/robot_packing/point_cloud_processor.py)
+
+**新增方法：**
+- `load_ply_file(path)` — 使用 Open3D 读取 PLY 文件，返回 (N,3) 点云数组
+- `generate_heightmap_from_ply(path)` — 一步完成 PLY → 预处理 → 高度图
+
+---
+
+### 3. [packing_planner.py](file:///d:/Code/robot_packing/packing_planner.py)
+
+**构造函数新增参数：**
+- `xy_only` — 仅XY旋转模式
+- `outer_height_tol` — 外侧高度阈值
+- `outer_height_ratio` — 违规列比例阈值
+
+**新增方法：**
+- `update_heightmap_from_ply(path)` — 从PLY文件更新高度图
+- `_check_outer_height_constraint()` — 外侧高度约束检查
+  - 逐列检查：里侧为空的列跳过，只看有内容的列
+  - 违规率 > 2/3 时才拒绝（允许里侧有少量空隙）
+- `_compute_surface_flatness()` — 表面平整度评分
+- `_compute_layer_completion()` — 层完成度评分
+- `_compute_void_penalty()` — 空隙惩罚评分
+- `_compute_step_profile()` — 阶梯轮廓奖励评分
+
+---
+
+### 4. [main.py](file:///d:/Code/robot_packing/main.py)
+
+**新增命令行参数（argparse）：**
+```
+python main.py                           # 普通模拟演示
+python main.py --xy-only                 # 仅XY旋转模式
+python main.py --ply scene.ply           # PLY文件模式
+python main.py --ply scene.ply --xy-only # PLY + 仅XY旋转
+python main.py --uneven                  # 不平底面演示
+```
+
+**新增 `run_demo_ply()` 函数：**
+- 从 PLY 加载初始高度图
+- 显示初始状态
+- 在已有高度图上放置新物品
+- 完整可视化
+
+---
+
+### 5. [test_packing.py](file:///d:/Code/robot_packing/test_packing.py)
+
+**新增测试：**
+- `test_orientations_xy_only()` — 验证 XY-only 模式仅生成2种朝向，roll/pitch=0
+- `test_packing_xy_only()` — 验证 XY-only 模式下装箱结果正确
+- `test_outer_height_constraint()` — 验证外侧高度约束生效
+
+## 测试结果
+
+全部 10 个测试通过 ✅

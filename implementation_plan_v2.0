@@ -1,0 +1,81 @@
+# 3D装箱系统优化：三项功能增强（修订版）
+
+## 目标
+
+1. 支持 PLY 文件作为输入，基于真实点云生成初始高度图，在此基础上放新物品
+2. 添加"仅XY旋转"开关，限制只在物体坐标系的XY方向旋转（绕Z轴90°）
+3. 添加放置高度新约束 + 优化评分策略，提升装载效率
+
+---
+
+## Proposed Changes
+
+### 1. config.py — 新增配置项
+
+```python
+PLY_FILE_PATH = None           # PLY 文件路径
+XY_ONLY_ROTATION = False       # 仅XY旋转开关
+OUTER_HEIGHT_TOLERANCE = 0.05  # 外侧高度约束阈值（5cm）
+OUTER_HEIGHT_CHECK_RATIO = 0.67  # 外侧高度检查列比例阈值
+```
+
+修改 `get_orientations(L,W,H, xy_only=False)`：
+- `xy_only=True` → 仅返回2种朝向（底面朝下 + 绕Z轴90°）
+
+### 2. point_cloud_processor.py — PLY 读取
+
+新增 `load_ply_file(path) -> np.ndarray` 和 `generate_heightmap_from_ply(path)` 方法。
+
+### 3. packing_planner.py — 核心改动
+
+#### 3a. 外侧高度约束（refined）
+
+**问题**：里侧可能有空隙，不应因空隙而错误拒绝合法位置。
+
+**方案：有效列占比检查**
+- 对于候选位置（row, col, item_rows, item_cols），新物体顶部 = `place_height + up_dim`
+- 逐列检查（col 到 col+item_cols 的每一列 c）：
+  1. 取该列 c 中 **里侧区域**（row+item_rows 到 grid_rows）的最大高度 `inner_h`
+  2. 如果 `inner_h == 0`（里侧该列为空），**跳过该列**（空隙不计入）
+  3. 如果 `inner_h > 0` 且新物体顶部 > `inner_h + tolerance`，标记该列为**违规列**
+- 计算违规率 = 违规列数 / 有效列数（有效列 = 里侧有内容的列）
+- 如果 **违规率 > `OUTER_HEIGHT_CHECK_RATIO`**（默认2/3），拒绝该位置
+- 如果里侧完全为空（所有列 inner_h=0），不施加约束（该位置本身就是最里面）
+
+#### 3b. 评分策略优化
+
+现有评分仅用简单线性加权（depth/left/low/fit），为实现**更快、更稳、容积率更高**，优化如下：
+
+| 策略 | 目的 | 实现 |
+|------|------|------|
+| **表面平整度奖励** | 放置后顶面越平越好，利于后续堆叠 | 计算放置后该区域周围高度方差，方差越小分越高 |
+| **层完成度奖励** | 鼓励填满当前层再上新层 | 若物体顶部与同层邻域高度一致，加分 |
+| **空隙惩罚** | 减少无法利用的死区 | 放置后检查底部是否产生不可填充的小空隙 |
+| **高度阶梯奖励** | 里高外低的阶梯结构最理想 | 新物体高度 ≤ 后方（里侧）高度时加分 |
+| **紧密贴合强化** | 减少间隙浪费 | 邻接面越多加分越多（含底面匹配度） |
+
+新权重配置：
+```python
+WEIGHT_DEPTH = 10.0    # 先里后外
+WEIGHT_LEFT  = 5.0     # 先左后右  
+WEIGHT_LOW   = 12.0    # 先下后上（提高权重）
+WEIGHT_FIT   = 3.0     # 紧凑度
+WEIGHT_SURFACE_FLAT = 4.0  # 表面平整度
+WEIGHT_LAYER_COMPLETE = 3.0  # 层完成度
+WEIGHT_VOID_PENALTY = -5.0   # 空隙惩罚
+WEIGHT_STEP_PROFILE = 4.0    # 阶梯轮廓奖励
+```
+
+### 4. main.py — 命令行支持
+
+- `--ply <path>`：从PLY文件加载初始状态
+- `--xy-only`：启用仅XY旋转模式
+- PLY模式下自动显示初始高度图，然后在此基础上放置新物品
+
+---
+
+## Verification Plan
+
+- 运行 `test_packing.py` 确保不破坏已有功能
+- 测试 `--ply` 和 `--xy-only` 命令行参数
+- 3D可视化验证外侧高度约束和评分效果
