@@ -20,9 +20,6 @@ from config import (
     CAGE_WIDTH, CAGE_LENGTH, CAGE_HEIGHT,
     HEIGHTMAP_RESOLUTION,
     PLACEMENT_GAP,
-    WEIGHT_DEPTH, WEIGHT_LEFT, WEIGHT_LOW, WEIGHT_FIT,
-    WEIGHT_SURFACE_FLAT, WEIGHT_LAYER_COMPLETE,
-    WEIGHT_VOID_PENALTY, WEIGHT_STEP_PROFILE,
     XY_ONLY_ROTATION,
     OUTER_HEIGHT_TOLERANCE, OUTER_HEIGHT_CHECK_RATIO,
     get_orientations,
@@ -83,17 +80,7 @@ class PackingPlanner:
         # 已放置的货物记录
         self.placed_items = []
         
-        # 基础权重（从config读取）
-        self._base_weights = {
-            'depth': WEIGHT_DEPTH,
-            'left': WEIGHT_LEFT,
-            'low': WEIGHT_LOW,
-            'fit': WEIGHT_FIT,
-            'surface_flat': WEIGHT_SURFACE_FLAT,
-            'layer_complete': WEIGHT_LAYER_COMPLETE,
-            'void_penalty': WEIGHT_VOID_PENALTY,
-            'step_profile': WEIGHT_STEP_PROFILE,
-        }
+
     
     # ------------------------------------------------------------------
     # 高度图更新
@@ -146,39 +133,6 @@ class PackingPlanner:
         fill_ratio = 0.6 * height_ratio + 0.4 * area_ratio
         return np.clip(fill_ratio, 0, 1)
     
-    def _get_adaptive_weights(self) -> dict:
-        """
-        根据当前填充状态动态调整评分权重。
-        
-        策略:
-        - 初期 (fill < 0.3): 强调 depth/low，建立良好底层结构
-        - 中期 (0.3~0.7):  平衡所有指标
-        - 后期 (fill > 0.7): 增大 fit/void_penalty/surface_flat，
-                              减小 depth（不再执着先里后外，空哪放哪）
-        """
-        fill = self._get_fill_ratio()
-        w = self._base_weights.copy()
-        
-        if fill < 0.3:
-            # 初期：稳定底层结构
-            # depth 和 low 保持高权重，其他维持基础值
-            pass
-        elif fill < 0.7:
-            # 中期：开始更注重紧凑
-            w['fit'] *= 1.5
-            w['void_penalty'] *= 1.3
-            w['surface_flat'] *= 1.2
-        else:
-            # 后期：最大化空间利用
-            w['depth'] *= 0.5        # 减弱"先里后外"——空间不够时不再执着
-            w['left'] *= 0.5         # 减弱"先左后右"
-            w['fit'] *= 2.0          # 大幅增强紧凑度
-            w['void_penalty'] *= 2.0 # 大幅增强空隙惩罚
-            w['surface_flat'] *= 1.5 # 增强平整度
-            w['layer_complete'] *= 1.5
-        
-        return w
-    
     def _get_adaptive_constraints(self) -> Tuple[float, float]:
         """
         动态约束松弛：仅对外侧高度约束进行松弛。
@@ -195,10 +149,10 @@ class PackingPlanner:
         tol = self.outer_height_tol_base
         ratio = self.outer_height_ratio_base
         
-        if fill > 0.5:
+        if fill > 0.7:
             # 后期：逐步放宽外侧高度约束
-            # fill=0.5 → 不变, fill=1.0 → 放宽到最大值
-            progress = (fill - 0.5) / 0.5  # 0 ~ 1
+            # fill=0.7 → 不变, fill=1.0 → 放宽到最大值
+            progress = (fill - 0.7) / 0.3  # 0 ~ 1
             tol = self.outer_height_tol_base + progress * 0.03   # 5cm → 8cm
             ratio = self.outer_height_ratio_base + progress * 0.13  # 0.67 → 0.80
             ratio = min(ratio, 0.85)  # 上限
@@ -316,11 +270,10 @@ class PackingPlanner:
         orientations = get_orientations(item_L, item_W, item_H, xy_only=use_xy_only)
         
         # 获取自适应权重和约束
-        adaptive_weights = self._get_adaptive_weights()
         adaptive_tol, adaptive_ratio = self._get_adaptive_constraints()
         
         best_candidate = None
-        best_score = -float('inf')
+        best_sort_key = (float('inf'), float('inf'), float('inf'), float('inf'))
         
         # 粗搜索步长
         coarse_step = max(1, min(5, min(self.processor.grid_rows, 
@@ -346,7 +299,7 @@ class PackingPlanner:
                     candidate = self._evaluate_position(
                         hm, row, col, item_rows, item_cols,
                         up_dim, base_x, base_y, ori,
-                        adaptive_weights, adaptive_tol, adaptive_ratio
+                        adaptive_tol, adaptive_ratio
                     )
                     if candidate is not None:
                         coarse_candidates.append(candidate)
@@ -359,13 +312,12 @@ class PackingPlanner:
                 candidate = self._evaluate_position(
                     hm, row, col, item_rows, item_cols,
                     up_dim, base_x, base_y, ori,
-                    adaptive_weights, adaptive_tol, adaptive_ratio
+                    adaptive_tol, adaptive_ratio
                 )
                 if candidate is not None:
                     coarse_candidates.append(candidate)
             
-            # ---- 阶段3：精搜索（Top-N 附近 + 角落）----
-            coarse_candidates.sort(key=lambda c: c['score'], reverse=True)
+            coarse_candidates.sort(key=lambda c: c['sort_key'])
             top_n = min(8, len(coarse_candidates))  # 增加精搜区域
             
             refined_positions = set()
@@ -390,10 +342,10 @@ class PackingPlanner:
                 candidate = self._evaluate_position(
                     hm, row, col, item_rows, item_cols,
                     up_dim, base_x, base_y, ori,
-                    adaptive_weights, adaptive_tol, adaptive_ratio
+                    adaptive_tol, adaptive_ratio
                 )
-                if candidate is not None and candidate['score'] > best_score:
-                    best_score = candidate['score']
+                if candidate is not None and candidate['sort_key'] < best_sort_key:
+                    best_sort_key = candidate['sort_key']
                     best_candidate = candidate
         
         if best_candidate is None:
@@ -416,7 +368,7 @@ class PackingPlanner:
         
         result = {
             'pose': pose,
-            'score': best_candidate['score'],
+            'sort_key': best_candidate['sort_key'],
             'orientation': best_candidate['orientation'],
             'grid_pos': (best_candidate['row'], best_candidate['col']),
             'place_height': best_candidate['place_height'],
@@ -438,7 +390,7 @@ class PackingPlanner:
     
     def _evaluate_position(self, hm, row, col, item_rows, item_cols,
                            up_dim, base_x, base_y, ori,
-                           weights, outer_tol, outer_ratio):
+                           outer_tol, outer_ratio):
         """评估单个候选位置，返回候选dict或None(不可行)。"""
         region = hm[row:row+item_rows, col:col+item_cols]
         place_height = np.max(region)
@@ -462,10 +414,10 @@ class PackingPlanner:
         ):
             return None
         
-        # 评分（使用自适应权重）
-        score = self._compute_score(
+        # 提取用于字典序比较的物理特征
+        sort_key = self._compute_lexicographical_keys(
             row, col, item_rows, item_cols,
-            place_height, up_dim, hm, weights
+            place_height, up_dim, hm
         )
         
         return {
@@ -473,7 +425,7 @@ class PackingPlanner:
             'item_rows': item_rows, 'item_cols': item_cols,
             'place_height': place_height, 'up_dim': up_dim,
             'orientation': ori, 'stability': stability,
-            'score': score,
+            'sort_key': sort_key,
         }
     
     # ------------------------------------------------------------------
@@ -523,237 +475,86 @@ class PackingPlanner:
         return violation_ratio <= ratio
     
     # ------------------------------------------------------------------
-    # 评分系统
+    # 字典序特征提取系统 (Lexicographical Keys)
     # ------------------------------------------------------------------
     
-    def _compute_score(self,
-                       row: int, col: int,
-                       item_rows: int, item_cols: int,
-                       place_height: float,
-                       up_dim: float,
-                       heightmap: np.ndarray,
-                       weights: Optional[dict] = None) -> float:
+    def _compute_lexicographical_keys(self,
+                                      row: int, col: int,
+                                      item_rows: int, item_cols: int,
+                                      place_height: float,
+                                      up_dim: float,
+                                      heightmap: np.ndarray) -> tuple:
         """
-        计算候选位置的综合评分（使用自适应权重）。
-        """
-        w = weights or self._base_weights
+        计算用于字典序排序的特征元组 (用于比较，越小越好)。
         
+        P1: void_volume  (底部空隙体积，越小越好)
+        P2: -adjacency   (四周贴合度，越大越优，取负后变为越小越好)
+        P3: z_max        (放置后的最高点，越小越好)
+        P4: corner_dist  (距离里左角的距离平方，越小越好)
+        """
+        region = heightmap[row:row+item_rows, col:col+item_cols]
         total_rows = self.processor.grid_rows
-        total_cols = self.processor.grid_cols
-        cage_h = self.processor.cage_height
         
+        # P1: void_volume
+        if place_height <= 0:
+            void_volume = 0.0
+        else:
+            void_heights = place_height - region
+            void_heights = np.maximum(void_heights, 0)
+            void_volume = np.sum(void_heights) * (self.processor.resolution ** 2)
+            
+        # P2: adjacency
+        adjacency = self._compute_adjacency(row, col, item_rows, item_cols, place_height + up_dim, heightmap)
+        
+        # P3: z_max
+        z_max = place_height + up_dim
+        
+        # P4: corner_dist
         center_row = row + item_rows / 2.0
         center_col = col + item_cols / 2.0
-        new_top = place_height + up_dim
+        dist_y = total_rows - center_row   # 距离里侧的行数
+        dist_x = center_col                # 距离左侧的列数
+        corner_dist = dist_y**2 + dist_x**2
         
-        # 1. 先里后外
-        depth_score = center_row / total_rows if total_rows > 0 else 0
+        # 防止浮点比较异常，圆整
+        return (round(float(void_volume), 6), -round(float(adjacency), 4), round(float(z_max), 4), round(float(corner_dist), 2))
         
-        # 2. 先左后右
-        left_score = 1.0 - (center_col / total_cols) if total_cols > 0 else 0
-        
-        # 3. 先下后上
-        low_score = 1.0 - (place_height / cage_h) if cage_h > 0 else 0
-        
-        # 4. 紧凑度
-        fit_score = self._compute_fit_score(
-            row, col, item_rows, item_cols, place_height, heightmap
-        )
-        
-        # 5. 表面平整度
-        surface_flat_score = self._compute_surface_flatness(
-            row, col, item_rows, item_cols, new_top, heightmap
-        )
-        
-        # 6. 层完成度
-        layer_score = self._compute_layer_completion(
-            row, col, item_rows, item_cols, new_top, heightmap
-        )
-        
-        # 7. 空隙惩罚
-        void_score = self._compute_void_penalty(
-            row, col, item_rows, item_cols, place_height, heightmap
-        )
-        
-        # 8. 阶梯轮廓奖励
-        step_score = self._compute_step_profile(
-            row, col, item_rows, item_cols, new_top, heightmap
-        )
-        
-        score = (
-            w['depth'] * depth_score +
-            w['left']  * left_score  +
-            w['low']   * low_score   +
-            w['fit']   * fit_score   +
-            w['surface_flat'] * surface_flat_score +
-            w['layer_complete'] * layer_score +
-            w['void_penalty'] * void_score +
-            w['step_profile'] * step_score
-        )
-        
-        return score
-    
-    # ------------------------------------------------------------------
-    # 评分子项
-    # ------------------------------------------------------------------
-    
-    def _compute_fit_score(self,
-                           row: int, col: int,
-                           item_rows: int, item_cols: int,
-                           place_height: float,
-                           heightmap: np.ndarray) -> float:
-        """
-        紧凑度评分：底面匹配度 + 侧面邻接度。
-        """
-        score = 0.0
-        total_rows, total_cols = heightmap.shape
-        
-        # 1. 底面匹配度
-        region = heightmap[row:row+item_rows, col:col+item_cols]
-        height_variance = np.var(region)
-        flatness_score = np.exp(-height_variance * 100)
-        score += flatness_score * 0.5
-        
-        # 2. 侧面邻接
+    def _compute_adjacency(self, row, col, item_rows, item_cols, new_top, heightmap):
+        """就算物体四周紧贴现有箱体或笼壁的比例，总分为4。"""
         adjacency = 0.0
+        total_rows, total_cols = heightmap.shape
+        tol = 0.05 # 5cm的高差内视为有效贴靠
         
+        # 左侧
         if col == 0:
             adjacency += 1.0
-        elif col > 0:
+        else:
             left_region = heightmap[row:row+item_rows, col-1]
-            if np.any(left_region >= place_height * 0.5):
-                adjacency += 0.5
-        
+            adjacency += np.sum(left_region >= new_top - tol) / item_rows
+            
+        # 右侧
         if col + item_cols >= total_cols:
             adjacency += 1.0
-        elif col + item_cols < total_cols:
+        else:
             right_region = heightmap[row:row+item_rows, col+item_cols]
-            if np.any(right_region >= place_height * 0.5):
-                adjacency += 0.5
-        
+            adjacency += np.sum(right_region >= new_top - tol) / item_rows
+            
+        # 里侧
         if row + item_rows >= total_rows:
             adjacency += 1.0
-        elif row + item_rows < total_rows:
-            back_region = heightmap[row+item_rows, col:col+item_cols]
-            if np.any(back_region >= place_height * 0.5):
-                adjacency += 0.5
-        
-        if row == 0:
-            adjacency += 0.5
-        elif row > 0:
-            front_region = heightmap[row-1, col:col+item_cols]
-            if np.any(front_region >= place_height * 0.5):
-                adjacency += 0.5
-                
-        score += adjacency / 4.0 * 0.5
-        
-        return score
-    
-    def _compute_surface_flatness(self,
-                                   row: int, col: int,
-                                   item_rows: int, item_cols: int,
-                                   new_top: float,
-                                   heightmap: np.ndarray) -> float:
-        """放置后表面平整度评分。"""
-        total_rows, total_cols = heightmap.shape
-        
-        expand = 5
-        r_start = max(0, row - expand)
-        r_end = min(total_rows, row + item_rows + expand)
-        c_start = max(0, col - expand)
-        c_end = min(total_cols, col + item_cols + expand)
-        
-        neighbor_region = heightmap[r_start:r_end, c_start:c_end].copy()
-        
-        neighbor_mask = np.ones_like(neighbor_region, dtype=bool)
-        rel_r = row - r_start
-        rel_c = col - c_start
-        neighbor_mask[rel_r:rel_r+item_rows, rel_c:rel_c+item_cols] = False
-        
-        neighbor_heights = neighbor_region[neighbor_mask]
-        neighbor_heights = neighbor_heights[neighbor_heights > 0]
-        
-        if len(neighbor_heights) == 0:
-            return 0.5
-        
-        height_diff = np.abs(neighbor_heights - new_top)
-        mean_diff = np.mean(height_diff)
-        return np.exp(-mean_diff * 10)
-    
-    def _compute_layer_completion(self,
-                                   row: int, col: int,
-                                   item_rows: int, item_cols: int,
-                                   new_top: float,
-                                   heightmap: np.ndarray) -> float:
-        """层完成度评分。"""
-        same_row_heights = heightmap[row:row+item_rows, :]
-        
-        tolerance = 0.02
-        matching = np.abs(same_row_heights - new_top) < tolerance
-        non_zero = same_row_heights > 0
-        
-        if np.sum(non_zero) == 0:
-            return 0.0
-        
-        match_ratio = np.sum(matching & non_zero) / np.sum(non_zero)
-        return match_ratio
-    
-    def _compute_void_penalty(self,
-                               row: int, col: int,
-                               item_rows: int, item_cols: int,
-                               place_height: float,
-                               heightmap: np.ndarray) -> float:
-        """空隙惩罚（正值，乘以负权重）。"""
-        region = heightmap[row:row+item_rows, col:col+item_cols]
-        
-        if place_height <= 0:
-            return 0.0
-        
-        void_heights = place_height - region
-        void_heights = np.maximum(void_heights, 0)
-        
-        avg_void = np.mean(void_heights)
-        void_ratio = avg_void / place_height if place_height > 0 else 0
-        return void_ratio
-    
-    def _compute_step_profile(self,
-                               row: int, col: int,
-                               item_rows: int, item_cols: int,
-                               new_top: float,
-                               heightmap: np.ndarray) -> float:
-        """阶梯轮廓奖励（里高外低）。"""
-        total_rows = heightmap.shape[0]
-        score = 0.0
-        
-        inner_start = row + item_rows
-        if inner_start < total_rows:
-            inner_region = heightmap[inner_start:min(inner_start+item_rows, total_rows), 
-                                     col:col+item_cols]
-            inner_heights = inner_region[inner_region > 0]
-            if len(inner_heights) > 0:
-                inner_max = np.max(inner_heights)
-                if new_top <= inner_max:
-                    score += 0.5
-                elif new_top <= inner_max + self.outer_height_tol_base:
-                    score += 0.3
-                else:
-                    score -= 0.2
-        
-        if row > 0:
-            outer_region = heightmap[max(0, row-item_rows):row, 
-                                     col:col+item_cols]
-            outer_heights = outer_region[outer_region > 0]
-            if len(outer_heights) > 0:
-                outer_max = np.max(outer_heights)
-                if new_top >= outer_max:
-                    score += 0.5
-                else:
-                    score += 0.2
         else:
-            score += 0.3
-        
-        return score
-    
+            back_region = heightmap[row+item_rows, col:col+item_cols]
+            adjacency += np.sum(back_region >= new_top - tol) / item_cols
+            
+        # 外侧 (前侧通常开口，或依靠前端物体)
+        if row == 0:
+            adjacency += 0.5 # 设定一个固定分补偿前侧开口
+        else:
+            front_region = heightmap[row-1, col:col+item_cols]
+            adjacency += np.sum(front_region >= new_top - tol) / item_cols
+            
+        return adjacency
+
     # ------------------------------------------------------------------
     # 统计
     # ------------------------------------------------------------------

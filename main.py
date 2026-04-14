@@ -132,7 +132,7 @@ def simulate_packing(planner: PackingPlanner,
             print(f"  朝向: {result['orientation']['desc']}")
             print(f"  网格位置: row={row}, col={col}")
             print(f"  放置高度: {result['place_height']:.4f} m")
-            print(f"  评分: {result['score']:.3f}")
+            print(f"  排序特征 (空隙, -贴靠, 高度, 角落距离): {result['sort_key']}")
             print(f"  支撑面积: {result['stability']['support_ratio']:.1%}")
             print(f"  底面倾斜: {result['stability']['tilt_angle']:.2f}°")
             print(f"  {format_pose_string(result['pose'])}")

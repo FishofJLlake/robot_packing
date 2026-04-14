@@ -291,7 +291,7 @@ def create_step_figure(step, total_steps, placed_items_so_far, current_item_info
         info_lines.append(f"")
         info_lines.append(f"放置高度: {result['place_height']:.3f} m")
         info_lines.append(f"支撑率: {result['stability']['support_ratio']:.0%}")
-        info_lines.append(f"评分: {result['score']:.2f}")
+        info_lines.append(f"排序特征: {result['sort_key']}")
         info_lines.append(f"")
         info_lines.append(f"{'─' * 24}")
         

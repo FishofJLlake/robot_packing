@@ -317,7 +317,7 @@ def test_packing_sequence():
             )
             print(f"  货物#{i+1} ({L}×{W}×{H}): "
                   f"pos=({row},{col}), h={result['place_height']:.3f}, "
-                  f"score={result['score']:.2f}")
+                  f"sort_key={result['sort_key']}")
         else:
             print(f"  货物#{i+1}: 无法放置")
     
