@@ -26,6 +26,7 @@ from config import (
     STATISTICAL_OUTLIER_NB_NEIGHBORS,
     STATISTICAL_OUTLIER_STD_RATIO,
     HEIGHTMAP_AGGREGATION,
+    PLY_CROP_X, PLY_CROP_Y, PLY_CROP_Z,
 )
 
 
@@ -69,6 +70,10 @@ class PointCloudProcessor:
         self.resolution  = resolution
         self.aggregation = aggregation
         
+        # 记录最新处理的点云数据用于外部3D可视化叠加
+        self.latest_points: Optional[np.ndarray] = None
+        self.latest_colors: Optional[np.ndarray] = None
+        
         # 计算高度图尺寸
         self.grid_cols = int(np.ceil(cage_width  / resolution))  # X方向格数
         self.grid_rows = int(np.ceil(cage_length / resolution))  # Y方向格数
@@ -85,19 +90,23 @@ class PointCloudProcessor:
     # 预处理
     # ------------------------------------------------------------------
 
-    def preprocess_point_cloud(self, points: np.ndarray) -> np.ndarray:
+    def preprocess_point_cloud(self, points: np.ndarray, is_real: bool = False, colors: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """
-        点云预处理：体素下采样 → 去噪 → ROI裁剪。
-        
+        预处理点云：下采样、去噪、裁剪。
+
         Parameters
         ----------
         points : np.ndarray, shape (N, 3)
             原始点云。
+        is_real : bool, optional
+            是否为真实采集点云（影响裁剪策略）。
+        colors : np.ndarray, optional
+            点云颜色。
         
         Returns
         -------
-        np.ndarray, shape (M, 3)
-            处理后的笼内点云。
+        Tuple[np.ndarray, Optional[np.ndarray]]
+            处理后的有效点云及对应颜色。
         """
         if len(points) == 0:
             return points
@@ -105,6 +114,8 @@ class PointCloudProcessor:
         if HAS_OPEN3D:
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(points)
+            if colors is not None:
+                pcd.colors = o3d.utility.Vector3dVector(colors)
 
             # ---- 1. Voxel downsample ----
             if VOXEL_DOWNSAMPLE_SIZE and VOXEL_DOWNSAMPLE_SIZE > 0:
@@ -114,14 +125,40 @@ class PointCloudProcessor:
             pcd = self._remove_outliers(pcd)
 
             points = np.asarray(pcd.points)
+            if pcd.has_colors():
+                colors = np.asarray(pcd.colors)
         
-        # ---- 3. ROI 裁剪：只保留笼内空间 ----
-        mask = (
-            (points[:, 0] >= self.x_min) & (points[:, 0] <= self.x_max) &
-            (points[:, 1] >= self.y_min) & (points[:, 1] <= self.y_max) &
-            (points[:, 2] >= self.z_min) & (points[:, 2] <= self.z_max)
-        )
-        return points[mask]
+        # ---- 3. ROI 裁剪：提取有效空间区域 ----
+        # 融合逻辑：真实点云按xyz配置裁剪，仿真点云按笼子范围裁剪
+        if is_real:
+            # 记录裁剪前的范围给用户反馈
+            if len(points) > 0:
+                print(f"  [信息] 裁剪前范围: X=[{points[:,0].min():.1f}, {points[:,0].max():.1f}], "
+                      f"Y=[{points[:,1].min():.1f}, {points[:,1].max():.1f}], "
+                      f"Z=[{points[:,2].min():.1f}, {points[:,2].max():.1f}]")
+            
+            mask = np.ones(len(points), dtype=bool)
+            if PLY_CROP_X is not None: mask &= (points[:, 0] >= PLY_CROP_X[0]) & (points[:, 0] <= PLY_CROP_X[1])
+            if PLY_CROP_Y is not None: mask &= (points[:, 1] >= PLY_CROP_Y[0]) & (points[:, 1] <= PLY_CROP_Y[1])
+            if PLY_CROP_Z is not None: mask &= (points[:, 2] >= PLY_CROP_Z[0]) & (points[:, 2] <= PLY_CROP_Z[1])
+            
+            # 反馈裁剪参数
+            print(f"  [信息] 实际采用裁剪配置: X={PLY_CROP_X}, Y={PLY_CROP_Y}, Z={PLY_CROP_Z}")
+        else:
+            mask = (
+                (points[:, 0] >= self.x_min) & (points[:, 0] <= self.x_max) &
+                (points[:, 1] >= self.y_min) & (points[:, 1] <= self.y_max) &
+                (points[:, 2] >= self.z_min) & (points[:, 2] <= self.z_max)
+            )
+            
+        pts_cropped = points[mask]
+        if is_real and len(pts_cropped) > 0:
+            print(f"  [信息] 裁剪后点数: {len(points)} -> {len(pts_cropped)}")
+            print(f"  [信息] 裁剪后范围: X=[{pts_cropped[:,0].min():.1f}, {pts_cropped[:,0].max():.1f}], "
+                  f"Y=[{pts_cropped[:,1].min():.1f}, {pts_cropped[:,1].max():.1f}], "
+                  f"Z=[{pts_cropped[:,2].min():.1f}, {pts_cropped[:,2].max():.1f}]")
+        
+        return pts_cropped, (colors[mask] if colors is not None else None)
 
     def _remove_outliers(self, pcd: 'o3d.geometry.PointCloud') -> 'o3d.geometry.PointCloud':
         """
@@ -154,6 +191,7 @@ class PointCloudProcessor:
 
     def generate_heightmap(self,
                            points: np.ndarray,
+                           is_real: bool = False,
                            aggregation: Optional[str] = None
                            ) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -175,6 +213,40 @@ class PointCloudProcessor:
             True 表示该 cell 有至少 1 个点投影，False 表示无数据。
         """
         agg = aggregation or self.aggregation
+        
+        # 针对真实点云：装箱区域不再是固定全笼大小，而是根据 PLY_CROP 的设定动态圈定
+        if is_real:
+            import math
+            from config import PLY_CROP_X, PLY_CROP_Y, PLY_CROP_Z
+            
+            # 使用用户定义的边界作为高度图的严格物理原点和范围
+            x_min_real = PLY_CROP_X[0] if (PLY_CROP_X and not math.isinf(PLY_CROP_X[0])) else np.min(points[:, 0]) if len(points) > 0 else 0
+            y_min_real = PLY_CROP_Y[0] if (PLY_CROP_Y and not math.isinf(PLY_CROP_Y[0])) else np.min(points[:, 1]) if len(points) > 0 else 0
+            z_min_real = PLY_CROP_Z[0] if (PLY_CROP_Z and not math.isinf(PLY_CROP_Z[0])) else np.min(points[:, 2]) if len(points) > 0 else 0
+            
+            x_max_real = PLY_CROP_X[1] if (PLY_CROP_X and not math.isinf(PLY_CROP_X[1])) else np.max(points[:, 0]) if len(points) > 0 else 0
+            y_max_real = PLY_CROP_Y[1] if (PLY_CROP_Y and not math.isinf(PLY_CROP_Y[1])) else np.max(points[:, 1]) if len(points) > 0 else 0
+            z_max_real = PLY_CROP_Z[1] if (PLY_CROP_Z and not math.isinf(PLY_CROP_Z[1])) else np.max(points[:, 2]) if len(points) > 0 else 0
+
+            self.real_scale = 0.001 if (x_max_real - x_min_real > 10.0 or abs(x_min_real) > 10.0) else 1.0
+
+            # 更新网格全局尺寸（非常重要，规划器将自动按这些新尺寸执行装箱约束）
+            real_width = (x_max_real - x_min_real) * self.real_scale
+            real_length = (y_max_real - y_min_real) * self.real_scale
+            
+            self.cage_width = real_width
+            self.cage_length = real_length
+            self.cage_height = (z_max_real - z_min_real) * self.real_scale
+
+            self.grid_cols = max(1, int(np.ceil(real_width / self.resolution)))
+            self.grid_rows = max(1, int(np.ceil(real_length / self.resolution)))
+
+            self.x_min_real, self.y_min_real, self.z_min_real = x_min_real, y_min_real, z_min_real
+        else:
+            # 仿真点云：始终按照初始化时的满载物理笼子规格计算网格
+            self.grid_cols = max(1, int(np.ceil((self.x_max - self.x_min) / self.resolution)))
+            self.grid_rows = max(1, int(np.ceil((self.y_max - self.y_min) / self.resolution)))
+
         heightmap = np.zeros((self.grid_rows, self.grid_cols), dtype=np.float64)
         valid_mask = np.zeros((self.grid_rows, self.grid_cols), dtype=bool)
         
@@ -182,9 +254,15 @@ class PointCloudProcessor:
             return heightmap, valid_mask
         
         # 计算每个点对应的格子索引
-        col_indices = ((points[:, 0] - self.x_min) / self.resolution).astype(int)
-        row_indices = ((points[:, 1] - self.y_min) / self.resolution).astype(int)
-        heights     = points[:, 2] - self.z_min  # 相对于笼底的高度
+        # 融合逻辑：真实点云需要动态对齐到矩阵原点并做单位换算 (如从毫米转为米)
+        if is_real:
+            col_indices = ((points[:, 0] - self.x_min_real) * self.real_scale / self.resolution).astype(int)
+            row_indices = ((points[:, 1] - self.y_min_real) * self.real_scale / self.resolution).astype(int)
+            heights     = (points[:, 2] - self.z_min_real) * self.real_scale
+        else:
+            col_indices = ((points[:, 0] - self.x_min) / self.resolution).astype(int)
+            row_indices = ((points[:, 1] - self.y_min) / self.resolution).astype(int)
+            heights     = points[:, 2] - self.z_min  # 相对于笼底的高度
         
         # 裁剪到有效范围
         valid = (
@@ -282,22 +360,42 @@ class PointCloudProcessor:
 
     def generate_heightmap_from_raw(self,
                                      raw_points: np.ndarray,
+                                     is_real: bool = False,
                                      aggregation: Optional[str] = None
                                      ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        一步完成：原始点云 → 预处理 → 高度图 + valid_mask。
+        一步完成：点云数据 → 预处理(融合裁剪/去噪) → 对齐高度图 + valid_mask。
         """
-        processed = self.preprocess_point_cloud(raw_points)
-        return self.generate_heightmap(processed, aggregation=aggregation)
+        processed, _ = self.preprocess_point_cloud(raw_points, is_real=is_real)
+        return self.generate_heightmap(processed, is_real=is_real, aggregation=aggregation)
 
     # ------------------------------------------------------------------
     # PLY 文件读取
     # ------------------------------------------------------------------
 
     @staticmethod
-    def load_ply_file(ply_path: str) -> np.ndarray:
+    def _visualize_with_axes(pcd, title="Point Cloud"):
+        """尝试使用带数值网格轴的高级视图，若不可用则回退至经典视图加坐标系显示。"""
+        import open3d as o3d
+        import sys
+        
+        print(f"  >>> [可视化] 正在弹窗显示 {title}。请关闭弹窗后继续运行...")
+        try:
+            # 尝试使用 Open3D 高级 GUI (支持坐标系数值网格，体验最佳)
+            o3d.visualization.draw(
+                {"name": "pcd", "geometry": pcd},
+                title=title,
+                show_skybox=False
+            )
+        except Exception:
+            # 如果高级 GUI 不支持(例如系统无特定共享库)，回退到经典带有坐标基准(红=X, 绿=Y, 蓝=Z)的显示
+            frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=500.0, origin=[0, 0, 0])
+            o3d.visualization.draw_geometries([pcd, frame], window_name=title)
+
+    @staticmethod
+    def load_ply_file(ply_path: str) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """
-        读取 PLY 文件中的点云数据。
+        纯净提取 PLY 文件中的点云坐标与颜色。
 
         Parameters
         ----------
@@ -306,15 +404,8 @@ class PointCloudProcessor:
 
         Returns
         -------
-        np.ndarray, shape (N, 3)
-            点云坐标 (x, y, z)。
-
-        Raises
-        ------
-        FileNotFoundError
-            文件不存在。
-        RuntimeError
-            读取失败或文件无有效点。
+        Tuple[np.ndarray, Optional[np.ndarray]]
+            点云坐标 (x, y, z) 和 颜色。
         """
         import os
         if not os.path.isfile(ply_path):
@@ -325,39 +416,65 @@ class PointCloudProcessor:
 
         pcd = o3d.io.read_point_cloud(ply_path)
         points = np.asarray(pcd.points)
-
+        colors = np.asarray(pcd.colors) if pcd.has_colors() else None
+        
         if len(points) == 0:
             raise RuntimeError(f"PLY 文件无有效点: {ply_path}")
+            
+        # =========================================================
+        # 坐标系转换 (根据现场视觉基准与系统约定的映射关系)
+        # 原始坐标：X=向右, Y=向上, Z=垂直向外
+        # 目标装箱系统约定坐标：X=向右, Y=向里, Z=向上
+        # =========================================================
+        # converted_points = np.empty_like(points)
+        # converted_points[:, 0] = points[:, 0]     # X 保持不变 (向右)
+        # converted_points[:, 1] = -points[:, 2]    # Y 变成向里 (原Z向外的反方向)
+        # converted_points[:, 2] = points[:, 1]     # Z 变成向上 (原Y向上的方向)
 
-        print(f"  PLY 文件已加载: {ply_path}")
-        print(f"  点数: {len(points)}")
-        print(f"  范围: X=[{points[:,0].min():.3f}, {points[:,0].max():.3f}], "
-              f"Y=[{points[:,1].min():.3f}, {points[:,1].max():.3f}], "
-              f"Z=[{points[:,2].min():.3f}, {points[:,2].max():.3f}]")
-
-        return points
+        return points, colors
 
     def generate_heightmap_from_ply(self,
                                      ply_path: str,
                                      aggregation: Optional[str] = None
                                      ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        一步完成：PLY 文件 → 读取 → 预处理 → 高度图 + valid_mask。
-
-        Parameters
-        ----------
-        ply_path : str
-            PLY 文件路径。
-        aggregation : str, optional
-            覆盖默认聚合方式。
-
-        Returns
-        -------
-        heightmap : np.ndarray, shape (grid_rows, grid_cols)
-        valid_mask : np.ndarray, shape (grid_rows, grid_cols), dtype=bool
+        统一完成真实场景的预演与处理：读取 → 预可视化 → 裁剪去噪 → 结果可视化 → 对齐高度图。
         """
-        raw_points = self.load_ply_file(ply_path)
-        return self.generate_heightmap_from_raw(raw_points, aggregation=aggregation)
+        import os
+        raw_points, raw_colors = self.load_ply_file(ply_path)
+        
+        if HAS_OPEN3D:
+            pcd_raw = o3d.geometry.PointCloud()
+            pcd_raw.points = o3d.utility.Vector3dVector(raw_points)
+            if raw_colors is not None:
+                pcd_raw.colors = o3d.utility.Vector3dVector(raw_colors)
+            PointCloudProcessor._visualize_with_axes(pcd_raw, title=f"Raw PLY - {os.path.basename(ply_path)}")
+            
+        # 统一使用预处理管线
+        processed_pts, processed_cls = self.preprocess_point_cloud(raw_points, is_real=True, colors=raw_colors)
+        
+        if HAS_OPEN3D and len(processed_pts) > 0:
+            pcd_proc = o3d.geometry.PointCloud()
+            pcd_proc.points = o3d.utility.Vector3dVector(processed_pts)
+            if processed_cls is not None:
+                pcd_proc.colors = o3d.utility.Vector3dVector(processed_cls)
+            PointCloudProcessor._visualize_with_axes(pcd_proc, title=f"Cropped & Processed PLY - {os.path.basename(ply_path)}")
+            
+        # 生成高度图 (这步同时会锁定新装箱原点、缩放配置)
+        heightmap, valid_mask = self.generate_heightmap(processed_pts, is_real=True, aggregation=aggregation)
+        
+        # 将发往 3D 结果总视图的散点坐标进行刚体平移对齐，与规划器里的笼子(0,0,0)原点相认
+        aligned_pts = np.copy(processed_pts)
+        if hasattr(self, 'x_min_real'):
+            aligned_pts[:, 0] = (aligned_pts[:, 0] - self.x_min_real) * getattr(self, 'real_scale', 1.0)
+            aligned_pts[:, 1] = (aligned_pts[:, 1] - getattr(self, 'y_min_real', 0.0)) * getattr(self, 'real_scale', 1.0)
+            aligned_pts[:, 2] = (aligned_pts[:, 2] - getattr(self, 'z_min_real', 0.0)) * getattr(self, 'real_scale', 1.0)
+            
+        # 记录映射对齐后的结果供外部工具使用（如3D装箱可视化）
+        self.latest_points = aligned_pts
+        self.latest_colors = processed_cls
+        
+        return heightmap, valid_mask
 
     # ------------------------------------------------------------------
     # 兼容接口：返回仅高度图（不含 mask）
@@ -369,8 +486,66 @@ class PointCloudProcessor:
         """
         与旧版接口兼容：仅返回高度图 ndarray，不返回 valid_mask。
         """
-        hm, _ = self.generate_heightmap(points, aggregation=aggregation)
+        hm, _ = self.generate_heightmap(points, is_real=False, aggregation=aggregation)
         return hm
+
+    # ------------------------------------------------------------------
+    # 工具函数：真实空间逆变换 (供给下游机械臂)
+    # ------------------------------------------------------------------
+    
+    def to_camera_absolute_pose(self, x_planner: float, y_planner: float, z_planner: float, rot_matrix_pkg: np.ndarray):
+        """
+        将基于本地局部特征装箱坐标系 (X向右, Y向里, Z向上) 算出的 6D位姿，
+        完全逆变换倒推回真实深度相机原始视角的坐标系 (X向右, Y向上, Z向外) 的绝对物理刻度。
+        
+        Returns
+        -------
+        (abs_x, abs_y, abs_z) : Tuple[float, float, float]
+            绝对物理位置 (单位对应于传入底层相机时使用的单位，若原始PLY用的是米，则此处为米)
+        rot_matrix_cam : np.ndarray
+            基于相机坐标系的旋转矩阵
+        euler_xyz_deg : Tuple[float, float, float]
+            基于相机的欧拉角 (Roll, Pitch, Yaw)
+        quat_xyzw : Tuple[float, float, float, float]
+            基于相机的四元数
+        """
+        import scipy.spatial.transform as transform
+        scale = getattr(self, 'real_scale', 1.0)
+        x_min = getattr(self, 'x_min_real', 0.0)
+        y_min = getattr(self, 'y_min_real', 0.0)
+        z_min = getattr(self, 'z_min_real', 0.0)
+        
+        # 1. 解除尺度与本地偏移，恢复到 Pkg 视角的绝对物理尺码
+        x_pkg = x_planner / scale + x_min
+        y_pkg = y_planner / scale + y_min
+        z_pkg = z_planner / scale + z_min
+        
+        # 2. 从 Pkg 坐标系倒推回 Cam 坐标系
+        # 之前前置转换是: X_pkg = X_cam, Y_pkg = -Z_cam, Z_pkg = Y_cam
+        # 现在反推还原: X_cam = X_pkg, Z_cam = -Y_pkg, Y_cam = Z_pkg
+        # x_cam = x_pkg
+        # y_cam = z_pkg
+        # z_cam = -y_pkg
+        
+        # 3. 倒推旋转矩阵
+        # 让相机向下的矩阵变换回到相机的局部基准
+        R_cp = np.array([
+            [1,  0,  0],
+            [0,  0,  1],
+            [0, -1,  0]
+        ])
+        rot_matrix_cam = R_cp @ rot_matrix_pkg
+        
+        try:
+            r = transform.Rotation.from_matrix(rot_matrix_cam)
+            abs_euler = tuple(r.as_euler('xyz', degrees=True))
+            abs_quat = tuple(r.as_quat())  # (x, y, z, w)
+        except Exception:
+            abs_euler = (0.0, 0.0, 0.0)
+            abs_quat = (0.0, 0.0, 0.0, 1.0)
+            
+        return (x_pkg, y_pkg, z_pkg), rot_matrix_cam, abs_euler, abs_quat
+
 
     # ------------------------------------------------------------------
     # 区域提取 & 坐标转换

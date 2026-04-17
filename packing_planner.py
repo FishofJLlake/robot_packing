@@ -546,9 +546,10 @@ class PackingPlanner:
             back_region = heightmap[row+item_rows, col:col+item_cols]
             adjacency += np.sum(back_region >= new_top - tol) / item_cols
             
-        # 外侧 (前侧通常开口，或依靠前端物体)
+        # 外侧/前部 (门是打开的，没有物理壁可以依靠，不计算贴合分)
         if row == 0:
-            adjacency += 0.5 # 设定一个固定分补偿前侧开口
+            pass  # 不提供贴合度分数
+
         else:
             front_region = heightmap[row-1, col:col+item_cols]
             adjacency += np.sum(front_region >= new_top - tol) / item_cols
@@ -561,11 +562,15 @@ class PackingPlanner:
     
     def get_packing_stats(self) -> dict:
         """返回当前装箱统计信息。"""
+        max_height = np.max(self.heightmap) if self.heightmap is not None else 0.0
+        
         if not self.placed_items:
             return {
                 'num_items': 0,
                 'volume_utilization': 0.0,
-                'max_height': 0.0,
+                'max_height': max_height,
+                'remaining_height': self.processor.cage_height - max_height,
+                'fill_ratio': 0.0,
             }
         
         total_volume = (self.processor.cage_width * 

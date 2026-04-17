@@ -135,7 +135,17 @@ def simulate_packing(planner: PackingPlanner,
             print(f"  排序特征 (空隙, -贴靠, 高度, 角落距离): {result['sort_key']}")
             print(f"  支撑面积: {result['stability']['support_ratio']:.1%}")
             print(f"  底面倾斜: {result['stability']['tilt_angle']:.2f}°")
-            print(f"  {format_pose_string(result['pose'])}")
+            print(f"  [内部局部] {format_pose_string(result['pose'])}")
+            
+            # --- 检测是否具备逆坐标系推导条件，输出给外部物理机器人 ---
+            if hasattr(planner.processor, 'to_camera_absolute_pose') and hasattr(planner.processor, 'x_min_real'):
+                pose = result['pose']
+                abs_pos, abs_rot, abs_euler, abs_quat = planner.processor.to_camera_absolute_pose(
+                    pose['position'][0], pose['position'][1], pose['position'][2], pose['rotation_matrix']
+                )
+                print(f"  [外部物理系统 (相机原点)] 位置(Z向外,Y向上): (X={abs_pos[0]:.4f}, Y={abs_pos[1]:.4f}, Z={abs_pos[2]:.4f})m")
+                print(f"  [外部物理系统] 欧拉角: ({abs_euler[0]:.2f}°, {abs_euler[1]:.2f}°, {abs_euler[2]:.2f}°)")
+                print(f"  [外部物理系统] 四元数(x,y,z,w): ({abs_quat[0]:.6f}, {abs_quat[1]:.6f}, {abs_quat[2]:.6f}, {abs_quat[3]:.6f})")
     
     if verbose:
         stats = planner.get_packing_stats()
@@ -160,7 +170,7 @@ def run_demo(xy_only=False):
     # 模拟来料：一批不同尺寸的快递箱
     # 尺寸单位：米 (L, W, H)
     items = [
-        (0.40, 0.30, 0.25),   # 中等快递箱
+        (0.10, 0.10, 0.10),   # 中等快递箱
         (0.35, 0.25, 0.20),   # 较小快递箱
         (0.50, 0.35, 0.30),   # 大号快递箱
         (0.30, 0.25, 0.15),   # 小号快递箱
@@ -230,13 +240,21 @@ def run_demo_ply(ply_path: str, xy_only: bool = False):
     
     visualize_heightmap(planner.heightmap, title="PLY 初始高度图")
     
+    import random
+    
     # 在已有高度图基础上放置新物品
     items = [
-        (0.40, 0.30, 0.25),   # 中等快递箱
-        (0.35, 0.25, 0.20),   # 较小快递箱
-        (0.30, 0.25, 0.15),   # 小号快递箱
-        (0.25, 0.20, 0.15),   # 迷你快递箱
+        (0.395, 0.310, 0.205),  # apriltag 1
+        (0.390, 0.310, 0.205),  # apriltag 2
+        (0.380, 0.340, 0.180),  # apriltag 3
+        (0.400, 0.300, 0.300),  # apriltag 4
+        (0.380, 0.320, 0.170),  # apriltag 5
+        (0.255, 0.200, 0.145),  # apriltag 6
+        (0.295, 0.250, 0.200),  # apriltag 7
+        (0.420, 0.410, 0.330),  # apriltag 8
     ]
+    # 打乱包裹顺序模拟随机来料
+    random.shuffle(items)
     
     print(f"\n在PLY初始状态上放置 {len(items)} 个新物品...")
     results = simulate_packing(planner, items, verbose=True)
@@ -258,6 +276,8 @@ def run_demo_ply(ply_path: str, xy_only: bool = False):
         cage_length=planner.processor.cage_length,
         cage_height=planner.processor.cage_height,
         placed_items=planner.placed_items,
+        point_cloud=getattr(planner.processor, 'latest_points', None),
+        point_colors=getattr(planner.processor, 'latest_colors', None),
         title="PLY + 新物品 3D视图"
     )
 

@@ -194,6 +194,7 @@ def visualize_packing_3d(cage_origin: Tuple[float, float, float],
                           cage_height: float,
                           placed_items: List[dict],
                           point_cloud: Optional[np.ndarray] = None,
+                          point_colors: Optional[np.ndarray] = None,
                           title: str = "3D装箱结果"):
     """
     使用Open3D的3D可视化窗口展示装箱结果。
@@ -206,6 +207,8 @@ def visualize_packing_3d(cage_origin: Tuple[float, float, float],
         每个元素包含 'dimensions' 和 'result' (plan_placement的返回值)
     point_cloud : np.ndarray, optional
         原始点云数据（用于背景显示）
+    point_colors : np.ndarray, optional
+        原始点云颜色数据
     """
     if not HAS_OPEN3D:
         print("Open3D未安装，跳过3D可视化。使用 pip install open3d 安装。")
@@ -224,7 +227,10 @@ def visualize_packing_3d(cage_origin: Tuple[float, float, float],
     if point_cloud is not None and len(point_cloud) > 0:
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(point_cloud)
-        pcd.paint_uniform_color([0.7, 0.7, 0.7])
+        if point_colors is not None and len(point_colors) == len(point_cloud):
+            pcd.colors = o3d.utility.Vector3dVector(point_colors)
+        else:
+            pcd.paint_uniform_color([0.7, 0.7, 0.7])
         geometries.append(pcd)
     
     # 3. 已放置的货物

@@ -98,7 +98,7 @@ class StabilityChecker:
         # 2. 底面倾斜角检测 & 平面拟合
         # ============================================================
         tilt_roll, tilt_pitch, tilt_angle = self._fit_surface_tilt(
-            heightmap_region, item_base_x, item_base_y
+            heightmap_region, item_base_x, item_base_y, support_mask
         )
         result['tilt_angle'] = np.rad2deg(tilt_angle)
         result['tilt_roll'] = tilt_roll
@@ -126,7 +126,8 @@ class StabilityChecker:
     def _fit_surface_tilt(self, 
                           heightmap_region: np.ndarray,
                           item_base_x: float,
-                          item_base_y: float) -> Tuple[float, float, float]:
+                          item_base_y: float,
+                          support_mask: np.ndarray = None) -> Tuple[float, float, float]:
         """
         用最小二乘法拟合放置区域的平面，计算倾斜角。
         
@@ -151,14 +152,18 @@ class StabilityChecker:
         ys_m = ys.ravel() * self.resolution
         zs = heightmap_region.ravel()
         
-        # 过滤掉零高度点（这些是没有支撑的空位），除非全是零
-        nonzero_mask = zs > 0
-        if np.sum(nonzero_mask) < 3:
+        # 只使用有实际支撑面的部分来计算倾角（容差之内），避免悬空部分造成数学平面极度倾斜
+        if support_mask is not None:
+            mask = support_mask.ravel()
+        else:
+            mask = zs > 0
+            
+        if np.sum(mask) < 3:
             return 0.0, 0.0, 0.0
         
-        xs_fit = xs_m[nonzero_mask]
-        ys_fit = ys_m[nonzero_mask]
-        zs_fit = zs[nonzero_mask]
+        xs_fit = xs_m[mask]
+        ys_fit = ys_m[mask]
+        zs_fit = zs[mask]
         
         # 最小二乘拟合: z = a*x + b*y + c
         A = np.column_stack([xs_fit, ys_fit, np.ones(len(xs_fit))])
