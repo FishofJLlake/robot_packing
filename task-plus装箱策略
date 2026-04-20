@@ -1,0 +1,6 @@
+- [x] 修改 `config.py`，加入 `TRY_PLUS_PACKING` 控制选项。
+- [x] 编写 `mujoco_simulator.py` 内部封装类 `MujocoSimulator`，实现基于 heightmap 和 box 信息去跑物理 step，输出 `is_inside_cage`、`final_pos`、`final_quat` 及 `final_rot_mat`。
+- [x] 修改 `stability_checker.py`。包含：当 `try_plus_packing` 开启，且具备里支撑但外悬空时（Y负梯度），对 `support_mask` 投影进行连续支撑厚度（长）比例的严格检验 `> 0.6`；放开 CoG 限制并返回 `will_tilt`。
+- [x] 修改 `packing_planner.py`，引入 `mujoco_simulator`。在选择出结果后判断 `will_tilt` 是否为 True。若为 True，调用 MuJoCo 仿真。若合格，存储原始设计成 `result['pose']`，并将仿真后斜放结果存至 `result['simulated_pose']`。
+- [x] 在 `packing_planner.py` 的 `update_heightmap_with_placement` 中处理 `simulated_pose`，对发生倾覆的物体基于其仿真后的外接包围盒(AABB)或光线追踪覆盖当前高度图 `heightmap` 以供下一次规划正确避障。
+- [x] 修改 `visualizer.py` 及 `visualize_demo.py` 中 Box 渲染部分。使其读取并实际应用 3D 的旋转矩阵（如果存在 `simulated_pose`，优先使其展示仿真后的最终静止形貌）；修缮原有被注释掉的 rotate 逻辑。

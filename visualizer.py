@@ -254,12 +254,26 @@ def visualize_packing_3d(cage_origin: Tuple[float, float, float],
         )
         # 移到原点居中
         mesh.translate([-base_x/2, -base_y/2, -up_dim/2])
-        # 应用旋转（仅倾斜微调，基础朝向已体现在尺寸映射中）
-        tilt_rot = pose['rotation_matrix']
-        # 这里简化处理：底面尺寸已经映射到世界XY,
-        # 只需要考虑倾斜微调（通常很小）
-        # 实际上基础旋转已经反映在base_dims的选择中
-        # mesh.rotate(tilt_rot, center=np.zeros(3))
+        # 应用旋转
+        sim_pose = result.get('simulated_pose')
+        if sim_pose:
+            # 基础尺寸已对应朝向，但物理引擎的位姿使用的是物品原尺寸，所以我们需要重新定义Box。
+            # 或者，因为已经按照base_x, base_y生成，我们需要通过旋转恢复物理模拟引擎给它的真实转角。
+            # 为简单起见，如果使用仿真位姿，直接运用仿真的 rotation matrix和位置
+            
+            # 使用真实的原始物品尺寸
+            orig_dim_L, orig_dim_W, orig_dim_H = item['dimensions']
+            mesh = o3d.geometry.TriangleMesh.create_box(
+                width=orig_dim_L, height=orig_dim_W, depth=orig_dim_H
+            )
+            mesh.translate([-orig_dim_L/2, -orig_dim_W/2, -orig_dim_H/2])
+            mesh.rotate(sim_pose['rotation_matrix'], center=np.zeros(3))
+            center = sim_pose['position']
+        else:
+            # 没有仿真，或者没有倾覆
+            # 基础倾斜微调
+            # mesh.rotate(pose['rotation_matrix'], center=np.zeros(3))
+            pass
         
         # 平移到放置位置
         mesh.translate(center)

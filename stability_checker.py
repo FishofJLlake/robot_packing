@@ -15,6 +15,8 @@ from config import (
     MAX_TILT_ANGLE,
     SUPPORT_HEIGHT_TOLERANCE,
     HEIGHTMAP_RESOLUTION,
+    TRY_PLUS_PACKING,
+    MIN_SUPPORT_LENGTH_RATIO_Y,
 )
 
 
@@ -66,7 +68,8 @@ class StabilityChecker:
             'tilt_angle': 0.0,
             'tilt_roll': 0.0,
             'tilt_pitch': 0.0,
-            'reason': ''
+            'reason': '',
+            'will_tilt': False
         }
         
         rows, cols = heightmap_region.shape
@@ -90,9 +93,26 @@ class StabilityChecker:
         result['support_ratio'] = support_ratio
         
         if support_ratio < self.min_support_ratio:
-            result['is_stable'] = False
-            result['reason'] = f'支撑面积不足: {support_ratio:.1%} < {self.min_support_ratio:.1%}'
-            return result
+            if not TRY_PLUS_PACKING:
+                result['is_stable'] = False
+                result['reason'] = f'支撑面积不足: {support_ratio:.1%} < {self.min_support_ratio:.1%}'
+                return result
+            else:
+                if support_ratio <= 0.01:
+                    result['is_stable'] = False
+                    result['reason'] = 'Plus策略: 支撑面积太小(<1%)，极不稳定'
+                    return result
+                # 检查里外偏心严重时的 Y 向支撑深度率
+                y_gradient = self._compute_y_gradient(heightmap_region)
+                if y_gradient < -0.01:  # "里侧高外侧低" (里侧支撑，外侧悬空)
+                    support_ys, _ = np.where(support_mask)
+                    if len(support_ys) > 0:
+                        y_min, y_max = np.min(support_ys), np.max(support_ys)
+                        support_length_y_ratio = (y_max - y_min + 1) / rows
+                        if support_length_y_ratio < MIN_SUPPORT_LENGTH_RATIO_Y:
+                            result['is_stable'] = False
+                            result['reason'] = f'Plus策略: 里端支撑且外悬空时支撑深度率({support_length_y_ratio:.1%})不足 {MIN_SUPPORT_LENGTH_RATIO_Y:.1%}'
+                            return result
         
         # ============================================================
         # 2. 底面倾斜角检测 & 平面拟合
@@ -117,9 +137,12 @@ class StabilityChecker:
             heightmap_region, support_mask, item_base_x, item_base_y
         )
         if not is_cog_stable:
-            result['is_stable'] = False
-            result['reason'] = cog_reason
-            return result
+            if TRY_PLUS_PACKING:
+                result['will_tilt'] = True
+            else:
+                result['is_stable'] = False
+                result['reason'] = cog_reason
+                return result
         
         return result
     

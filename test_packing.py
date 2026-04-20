@@ -204,7 +204,8 @@ def test_packing_planner_empty_cage():
     item_rows, item_cols = result['item_grid_size']
     planner.update_heightmap_with_placement(
         row, col, item_rows, item_cols,
-        result['place_height'], result['orientation']['up_dim']
+        result['place_height'], result['orientation']['up_dim'],
+        simulated_pose=result.get('simulated_pose')
     )
     
     print("  ✅ 空笼装箱测试通过\n")
@@ -266,7 +267,8 @@ def test_outer_height_constraint():
     r1, c1 = result1['item_grid_size']
     planner.update_heightmap_with_placement(
         row1, col1, r1, c1,
-        result1['place_height'], result1['orientation']['up_dim']
+        result1['place_height'], result1['orientation']['up_dim'],
+        simulated_pose=result1.get('simulated_pose')
     )
     print(f"  里侧物体: row={row1}, 高={result1['place_height'] + result1['orientation']['up_dim']:.3f}m")
     
@@ -313,7 +315,8 @@ def test_packing_sequence():
             item_rows, item_cols = result['item_grid_size']
             planner.update_heightmap_with_placement(
                 row, col, item_rows, item_cols,
-                result['place_height'], result['orientation']['up_dim']
+                result['place_height'], result['orientation']['up_dim'],
+                simulated_pose=result.get('simulated_pose')
             )
             print(f"  货物#{i+1} ({L}×{W}×{H}): "
                   f"pos=({row},{col}), h={result['place_height']:.3f}, "
@@ -327,6 +330,7 @@ def test_packing_sequence():
     print(f"  最大高度: {stats['max_height']:.3f} m")
     
     print("  ✅ 连续装箱测试通过\n")
+    return planner
 
 
 def test_pose_generation():

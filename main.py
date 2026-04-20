@@ -106,6 +106,10 @@ def simulate_packing(planner: PackingPlanner,
         print(f"  仅XY旋转: {'是' if planner.xy_only else '否'}")
         print("=" * 60)
     
+    # 保存初始高度图便于随后环境建模（如Mujoco）
+    if not hasattr(planner, 'initial_heightmap'):
+        planner.initial_heightmap = planner.heightmap.copy()
+    
     for i, (L, W, H) in enumerate(items):
         if verbose:
             print(f"\n--- 货物 #{i+1}: {L:.3f} × {W:.3f} × {H:.3f} m ---")
@@ -122,7 +126,8 @@ def simulate_packing(planner: PackingPlanner,
         item_rows, item_cols = result['item_grid_size']
         planner.update_heightmap_with_placement(
             row, col, item_rows, item_cols,
-            result['place_height'], result['orientation']['up_dim']
+            result['place_height'], result['orientation']['up_dim'],
+            simulated_pose=result.get('simulated_pose')
         )
         
         results.append(result)
@@ -209,6 +214,7 @@ def run_demo(xy_only=False):
         placed_items=planner.placed_items,
         title="3D装箱结果"
     )
+    return planner
 
 
 def run_demo_ply(ply_path: str, xy_only: bool = False):
@@ -280,6 +286,7 @@ def run_demo_ply(ply_path: str, xy_only: bool = False):
         point_colors=getattr(planner.processor, 'latest_colors', None),
         title="PLY + 新物品 3D视图"
     )
+    return planner
 
 
 def run_demo_uneven_surface(xy_only=False):
@@ -323,6 +330,7 @@ def run_demo_uneven_surface(xy_only=False):
         placed_items=planner.placed_items,
         title="不平底面装箱 — 3D视图"
     )
+    return planner
 
 
 def realtime_interface():
@@ -397,15 +405,36 @@ def parse_args():
                         help='启用仅XY旋转模式（物体底面朝下，绕Z轴旋转0°/90°）')
     parser.add_argument('--uneven', action='store_true', default=False,
                         help='运行不平底面装箱演示')
+    parser.add_argument('--visualize-mujoco', action='store_true', default=False,
+                        help='在终端输出后启动高级 MuJoCo 3D物理模拟 Viewer 来还原下落堆垛全过程')
     return parser.parse_args()
 
 
-if __name__ == '__main__':
+def main():
     args = parse_args()
     
-    if args.ply:
-        run_demo_ply(args.ply, xy_only=args.xy_only)
-    elif args.uneven:
-        run_demo_uneven_surface(xy_only=args.xy_only)
+    # 根据参数选择演示模式
+    if args.uneven:
+        planner = run_demo_uneven_surface(xy_only=args.xy_only)
+    elif args.ply:
+        planner = run_demo_ply(args.ply, xy_only=args.xy_only)
     else:
-        run_demo(xy_only=args.xy_only)
+        planner = run_demo(xy_only=args.xy_only)
+        
+    if args.visualize_mujoco and planner and hasattr(planner, 'placed_items'):
+        from visualize_mujoco import replay_packing_process
+        from config import CAGE_WIDTH, CAGE_LENGTH, CAGE_HEIGHT
+        
+        cage_origin = planner.processor.cage_origin
+        initial_hm = getattr(planner, 'initial_heightmap', None)
+        resolution = planner.processor.resolution
+        replay_packing_process(
+            planner.placed_items, cage_origin, 
+            [CAGE_WIDTH, CAGE_LENGTH, CAGE_HEIGHT],
+            initial_heightmap=initial_hm,
+            resolution=resolution
+        )
+
+
+if __name__ == "__main__":
+    main()

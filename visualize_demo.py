@@ -166,11 +166,16 @@ def create_step_figure(step, total_steps, placed_items_so_far, current_item_info
         row, col = result['grid_pos']
         place_h = result['place_height']
         
-        box_origin = (
-            cage_origin[0] + col * resolution,
-            cage_origin[1] + row * resolution,
-            cage_origin[2] + place_h,
-        )
+        sim_pose = result.get('simulated_pose')
+        if sim_pose:
+            pos = sim_pose['position']
+            box_origin = (pos[0] - base_x/2.0, pos[1] - base_y/2.0, pos[2] - up_dim/2.0)
+        else:
+            box_origin = (
+                cage_origin[0] + col * resolution,
+                cage_origin[1] + row * resolution,
+                cage_origin[2] + place_h,
+            )
         box_size = (base_x, base_y, up_dim)
         
         color = ITEM_COLORS[i % len(ITEM_COLORS)]
@@ -186,11 +191,16 @@ def create_step_figure(step, total_steps, placed_items_so_far, current_item_info
         row, col = result['grid_pos']
         place_h = result['place_height']
         
-        box_origin = (
-            cage_origin[0] + col * resolution,
-            cage_origin[1] + row * resolution,
-            cage_origin[2] + place_h,
-        )
+        sim_pose = result.get('simulated_pose')
+        if sim_pose:
+            pos = sim_pose['position']
+            box_origin = (pos[0] - base_x/2.0, pos[1] - base_y/2.0, pos[2] - up_dim/2.0)
+        else:
+            box_origin = (
+                cage_origin[0] + col * resolution,
+                cage_origin[1] + row * resolution,
+                cage_origin[2] + place_h,
+            )
         box_size = (base_x, base_y, up_dim)
         
         idx = len(placed_items_so_far) - 1
@@ -394,7 +404,8 @@ def run_visual_demo():
         item_rows, item_cols = result['item_grid_size']
         planner.update_heightmap_with_placement(
             row, col, item_rows, item_cols,
-            result['place_height'], result['orientation']['up_dim']
+            result['place_height'], result['orientation']['up_dim'],
+            simulated_pose=result.get('simulated_pose')
         )
         
         placed_so_far.append({
@@ -497,11 +508,15 @@ def create_overview_figure(placed_items, planner, cage_origin, output_dir):
             rr, cc = r['grid_pos']
             p_h = r['place_height']
             
-            box_origin = (
-                cage_origin[0] + cc * resolution,
-                cage_origin[1] + rr * resolution,
-                cage_origin[2] + p_h,
-            )
+            sim_pose = r.get('simulated_pose')
+            if sim_pose:
+                box_origin = (sim_pose['position'][0] - bx/2.0, sim_pose['position'][1] - by/2.0, sim_pose['position'][2] - ud/2.0)
+            else:
+                box_origin = (
+                    cage_origin[0] + cc * resolution,
+                    cage_origin[1] + rr * resolution,
+                    cage_origin[2] + p_h,
+                )
             
             color = ITEM_COLORS[j % len(ITEM_COLORS)]
             is_new = (j == idx)

@@ -27,6 +27,8 @@ from config import (
 from point_cloud_processor import PointCloudProcessor
 from stability_checker import StabilityChecker
 from pose_generator import compute_6d_pose, format_pose_string
+from mujoco_simulator import MujocoSimulator
+from scipy.spatial.transform import Rotation
 
 
 class PackingPlanner:
@@ -69,6 +71,11 @@ class PackingPlanner:
         self.outer_height_tol_base = outer_height_tol
         self.outer_height_ratio_base = outer_height_ratio
         
+        self.simulator = MujocoSimulator(
+            self.processor.cage_origin, self.processor.cage_width, 
+            self.processor.cage_length, self.processor.cage_height, self.processor.resolution
+        )
+        
         # 内部维护当前高度图及有效掩码
         self.heightmap = np.zeros(
             (processor.grid_rows, processor.grid_cols), dtype=np.float64
@@ -97,16 +104,30 @@ class PackingPlanner:
     def update_heightmap_with_placement(self, 
                                          row: int, col: int,
                                          item_rows: int, item_cols: int,
-                                         place_height: float, item_up: float):
+                                         place_height: float, item_up: float, simulated_pose: Optional[dict] = None):
         """
-        在高度图上标记新放置的货物（模拟模式使用）。
+        在高度图上标记新放置的货物（模拟模式使用）。若是模拟倾覆的位姿，则基于最大包裹尺寸更新高度图安全区域。
         """
-        new_height = place_height + item_up
-        r_end = min(row + item_rows, self.processor.grid_rows)
-        c_end = min(col + item_cols, self.processor.grid_cols)
-        self.heightmap[row:r_end, col:c_end] = np.maximum(
-            self.heightmap[row:r_end, col:c_end], new_height
-        )
+        if simulated_pose:
+            # 使用倾倒后的粗略外接盒边界（防碰撞安全）
+            z_top = simulated_pose['position'][2] + max(item_rows, item_cols)*self.processor.resolution/2.0
+            new_height = max(place_height + item_up, z_top)
+            # 倾倒可能使物体向外占据更多网格，扩宽绘制区域以策安全
+            pad = int(min(item_rows, item_cols) * 0.3)
+            r_start = max(0, row - pad)
+            c_start = max(0, col - pad)
+            r_end = min(row + item_rows + pad, self.processor.grid_rows)
+            c_end = min(col + item_cols + pad, self.processor.grid_cols)
+            self.heightmap[r_start:r_end, c_start:c_end] = np.maximum(
+                self.heightmap[r_start:r_end, c_start:c_end], new_height
+            )
+        else:
+            new_height = place_height + item_up
+            r_end = min(row + item_rows, self.processor.grid_rows)
+            c_end = min(col + item_cols, self.processor.grid_cols)
+            self.heightmap[row:r_end, col:c_end] = np.maximum(
+                self.heightmap[row:r_end, col:c_end], new_height
+            )
     
     # ------------------------------------------------------------------
     # 填充状态评估
@@ -272,8 +293,7 @@ class PackingPlanner:
         # 获取自适应权重和约束
         adaptive_tol, adaptive_ratio = self._get_adaptive_constraints()
         
-        best_candidate = None
-        best_sort_key = (float('inf'), float('inf'), float('inf'), float('inf'))
+        all_candidates = []
         
         # 粗搜索步长
         coarse_step = max(1, min(5, min(self.processor.grid_rows, 
@@ -344,45 +364,62 @@ class PackingPlanner:
                     up_dim, base_x, base_y, ori,
                     adaptive_tol, adaptive_ratio
                 )
-                if candidate is not None and candidate['sort_key'] < best_sort_key:
-                    best_sort_key = candidate['sort_key']
-                    best_candidate = candidate
+                if candidate is not None:
+                    all_candidates.append(candidate)
         
-        if best_candidate is None:
+        if not all_candidates:
             return None
+            
+        all_candidates.sort(key=lambda c: c['sort_key'])
         
-        # 生成6D位姿
-        pose = compute_6d_pose(
-            cage_origin=self.processor.cage_origin,
-            row=best_candidate['row'],
-            col=best_candidate['col'],
-            item_grid_rows=best_candidate['item_rows'],
-            item_grid_cols=best_candidate['item_cols'],
-            place_height=best_candidate['place_height'],
-            item_up_dim=best_candidate['up_dim'],
-            orientation=best_candidate['orientation'],
-            tilt_roll=best_candidate['stability']['tilt_roll'],
-            tilt_pitch=best_candidate['stability']['tilt_pitch'],
-            resolution=self.processor.resolution,
-        )
-        
-        result = {
-            'pose': pose,
-            'sort_key': best_candidate['sort_key'],
-            'orientation': best_candidate['orientation'],
-            'grid_pos': (best_candidate['row'], best_candidate['col']),
-            'place_height': best_candidate['place_height'],
-            'item_grid_size': (best_candidate['item_rows'], best_candidate['item_cols']),
-            'stability': best_candidate['stability'],
-        }
-        
-        # 记录已放置货物
-        self.placed_items.append({
-            'dimensions': (item_L, item_W, item_H),
-            'result': result,
-        })
-        
-        return result
+        for cand in all_candidates:
+            pose = compute_6d_pose(
+                cage_origin=self.processor.cage_origin,
+                row=cand['row'],
+                col=cand['col'],
+                item_grid_rows=cand['item_rows'],
+                item_grid_cols=cand['item_cols'],
+                place_height=cand['place_height'],
+                item_up_dim=cand['up_dim'],
+                orientation=cand['orientation'],
+                tilt_roll=cand['stability']['tilt_roll'],
+                tilt_pitch=cand['stability']['tilt_pitch'],
+                resolution=self.processor.resolution,
+            )
+            
+            result = {
+                'pose': pose,
+                'sort_key': cand['sort_key'],
+                'orientation': cand['orientation'],
+                'grid_pos': (cand['row'], cand['col']),
+                'place_height': cand['place_height'],
+                'item_grid_size': (cand['item_rows'], cand['item_cols']),
+                'stability': cand['stability'],
+            }
+            
+            if cand['stability'].get('will_tilt', False):
+                is_inside, f_pos, f_quat = self.simulator.simulate_tilt(
+                    hm, (item_L, item_W, item_H), pose['position'], pose['quaternion']
+                )
+                if not is_inside:
+                    continue  # fallback to next candidate
+                
+                rot = Rotation.from_quat(f_quat)
+                result['simulated_pose'] = {
+                    'position': f_pos,
+                    'quaternion': f_quat,
+                    'rotation_matrix': rot.as_matrix(),
+                    'orientation_euler': rot.as_euler('XYZ')
+                }
+            
+            self.placed_items.append({
+                'dimensions': (item_L, item_W, item_H),
+                'result': result,
+            })
+            
+            return result
+            
+        return None
     
     # ------------------------------------------------------------------
     # 位置评估
