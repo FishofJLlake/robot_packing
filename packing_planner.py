@@ -454,7 +454,8 @@ class PackingPlanner:
         # 提取用于字典序比较的物理特征
         sort_key = self._compute_lexicographical_keys(
             row, col, item_rows, item_cols,
-            place_height, up_dim, hm
+            place_height, up_dim, hm,
+            base_x=base_x, base_y=base_y
         )
         
         return {
@@ -515,15 +516,77 @@ class PackingPlanner:
     # 字典序特征提取系统 (Lexicographical Keys)
     # ------------------------------------------------------------------
     
+    def _compute_max_available_area(self,
+                                      hm: np.ndarray,
+                                      row: int, col: int,
+                                      item_rows: int, item_cols: int,
+                                      place_height: float) -> float:
+        """
+        计算候选位置处可容纳的最大长方体底面面积（Best-Fit 策略）。
+
+        以物品占位区为种子，沿上下左右 4 个方向逐列/逐行扩展，
+        直到碰到高于 place_height 的障碍物或笼壁。
+
+        注：使用底面面积而非体积，避免笼顶附近 available_height 缩小
+        导致 fit_ratio 被人为抬高的失真问题。高度优化由 P3 (z_max) 独立负责。
+
+        Parameters
+        ----------
+        hm : np.ndarray
+            当前高度图。
+        row, col : int
+            候选放置起始行列。
+        item_rows, item_cols : int
+            物品占位行列数。
+        place_height : float
+            放置高度（物品底面高度）。
+
+        Returns
+        -------
+        float : 最大可用底面面积（平方米）。
+        """
+        total_rows, total_cols = hm.shape
+
+        # "同层"阈值：cell 高度不超过放置面 + 5mm 容差
+        threshold = place_height + 0.005
+
+        # --- 向左扩展 ---
+        left = col
+        while left > 0 and np.all(hm[row:row + item_rows, left - 1] <= threshold):
+            left -= 1
+
+        # --- 向右扩展 ---
+        right = col + item_cols
+        while right < total_cols and np.all(hm[row:row + item_rows, right] <= threshold):
+            right += 1
+
+        # --- 向外扩展 (小 row 方向) ---
+        front = row
+        while front > 0 and np.all(hm[front - 1, left:right] <= threshold):
+            front -= 1
+
+        # --- 向里扩展 (大 row 方向) ---
+        back = row + item_rows
+        while back < total_rows and np.all(hm[back, left:right] <= threshold):
+            back += 1
+
+        expanded_width = (right - left) * self.processor.resolution
+        expanded_depth = (back - front) * self.processor.resolution
+
+        return expanded_width * expanded_depth
+
     def _compute_lexicographical_keys(self,
                                       row: int, col: int,
                                       item_rows: int, item_cols: int,
                                       place_height: float,
                                       up_dim: float,
-                                      heightmap: np.ndarray) -> tuple:
+                                      heightmap: np.ndarray,
+                                      base_x: float = 0.0,
+                                      base_y: float = 0.0) -> tuple:
         """
         计算用于字典序排序的特征元组 (用于比较，越小越好)。
         
+        P0: -fit_ratio   (空间匹配度，越大越优 → 取负越小越好)
         P1: void_volume  (底部空隙体积，越小越好)
         P2: -adjacency   (四周贴合度，越大越优，取负后变为越小越好)
         P3: z_max        (放置后的最高点，越小越好)
@@ -531,6 +594,18 @@ class PackingPlanner:
         """
         region = heightmap[row:row+item_rows, col:col+item_cols]
         total_rows = self.processor.grid_rows
+        
+        # P0: fit_ratio (空间匹配度，Best-Fit 策略)
+        # 使用底面面积比而非体积比，避免笼顶附近 available_height 缩小导致 ratio 失真
+        item_area = base_x * base_y
+        if item_area > 0:
+            available_area = self._compute_max_available_area(
+                heightmap, row, col, item_rows, item_cols, place_height
+            )
+            fit_ratio = item_area / available_area if available_area > 0 else 1.0
+            fit_ratio = min(fit_ratio, 1.0)
+        else:
+            fit_ratio = 0.0
         
         # P1: void_volume
         if place_height <= 0:
@@ -553,8 +628,8 @@ class PackingPlanner:
         dist_x = center_col                # 距离左侧的列数
         corner_dist = dist_y**2 + dist_x**2
         
-        # 防止浮点比较异常，圆整
-        return (round(float(void_volume), 6), -round(float(adjacency), 4), round(float(z_max), 4), round(float(corner_dist), 2))
+        # 防止浮点比较异常，圆整 (fit_ratio 保留2位小数做适度分桶)
+        return (-round(float(fit_ratio), 2), round(float(void_volume), 6), -round(float(adjacency), 4), round(float(z_max), 4), round(float(corner_dist), 2))
         
     def _compute_adjacency(self, row, col, item_rows, item_cols, new_top, heightmap):
         """就算物体四周紧贴现有箱体或笼壁的比例，总分为4。"""
