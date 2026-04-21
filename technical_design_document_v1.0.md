@@ -642,7 +642,7 @@ sequenceDiagram
 |------|--------|------|
 | `MIN_SUPPORT_RATIO` | 0.60 | 底部最低支撑面积比 |
 | `MAX_TILT_ANGLE` | 5.0° | 最大允许倾斜角 |
-| `SUPPORT_HEIGHT_TOLERANCE` | 0.05m | 支撑高度容差（5cm内视为同一平面）|
+| `SUPPORT_HEIGHT_TOLERANCE` | 0.02m | 支撑高度容差（2cm内视为同一平面）|
 
 ### 9.3 约束参数
 

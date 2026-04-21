@@ -547,33 +547,48 @@ class PackingPlanner:
         """
         total_rows, total_cols = hm.shape
 
-        # "同层"阈值：cell 高度不超过放置面 + 5mm 容差
-        threshold = place_height + 0.005
+        # "同层"阈值：cell 高度不超过放置面 + 10mm 容差
+        threshold = place_height + 0.01
 
-        # --- 向左扩展 ---
-        left = col
-        while left > 0 and np.all(hm[row:row + item_rows, left - 1] <= threshold):
-            left -= 1
+        # --- 策略 A：先横向扩展，再纵向扩展 ---
+        left_a = col
+        while left_a > 0 and np.all(hm[row:row + item_rows, left_a - 1] <= threshold):
+            left_a -= 1
 
-        # --- 向右扩展 ---
-        right = col + item_cols
-        while right < total_cols and np.all(hm[row:row + item_rows, right] <= threshold):
-            right += 1
+        right_a = col + item_cols
+        while right_a < total_cols and np.all(hm[row:row + item_rows, right_a] <= threshold):
+            right_a += 1
 
-        # --- 向外扩展 (小 row 方向) ---
-        front = row
-        while front > 0 and np.all(hm[front - 1, left:right] <= threshold):
-            front -= 1
+        front_a = row
+        while front_a > 0 and np.all(hm[front_a - 1, left_a:right_a] <= threshold):
+            front_a -= 1
 
-        # --- 向里扩展 (大 row 方向) ---
-        back = row + item_rows
-        while back < total_rows and np.all(hm[back, left:right] <= threshold):
-            back += 1
+        back_a = row + item_rows
+        while back_a < total_rows and np.all(hm[back_a, left_a:right_a] <= threshold):
+            back_a += 1
 
-        expanded_width = (right - left) * self.processor.resolution
-        expanded_depth = (back - front) * self.processor.resolution
+        area_a = (right_a - left_a) * (back_a - front_a) * (self.processor.resolution ** 2)
 
-        return expanded_width * expanded_depth
+        # --- 策略 B：先纵向扩展，再横向扩展 ---
+        front_b = row
+        while front_b > 0 and np.all(hm[front_b - 1, col:col + item_cols] <= threshold):
+            front_b -= 1
+
+        back_b = row + item_rows
+        while back_b < total_rows and np.all(hm[back_b, col:col + item_cols] <= threshold):
+            back_b += 1
+
+        left_b = col
+        while left_b > 0 and np.all(hm[front_b:back_b, left_b - 1] <= threshold):
+            left_b -= 1
+
+        right_b = col + item_cols
+        while right_b < total_cols and np.all(hm[front_b:back_b, right_b] <= threshold):
+            right_b += 1
+
+        area_b = (right_b - left_b) * (back_b - front_b) * (self.processor.resolution ** 2)
+
+        return max(area_a, area_b)
 
     def _compute_lexicographical_keys(self,
                                       row: int, col: int,
