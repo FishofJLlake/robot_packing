@@ -22,6 +22,7 @@ from config import (
     PLACEMENT_GAP,
     XY_ONLY_ROTATION,
     OUTER_HEIGHT_TOLERANCE, OUTER_HEIGHT_CHECK_RATIO,
+    TRY_PLUS_PACKING, ENABLE_MUJOCO_SIMULATION,
     get_orientations,
 )
 from point_cloud_processor import PointCloudProcessor
@@ -370,9 +371,22 @@ class PackingPlanner:
         if not all_candidates:
             return None
             
-        all_candidates.sort(key=lambda c: c['sort_key'])
+        strict_cands = [c for c in all_candidates if c['stability']['stability_level'] == 'STRICT']
+        plus_cands = [c for c in all_candidates if c['stability']['stability_level'] == 'PLUS']
         
-        for cand in all_candidates:
+        strict_cands.sort(key=lambda c: c['sort_key'])
+        plus_cands.sort(key=lambda c: c['sort_key'])
+        
+        # 优先尝试严格稳定的策略，如果都不行，且开启了 PLUS 策略，则尝试降级方案
+        if TRY_PLUS_PACKING:
+            final_candidates = strict_cands + plus_cands
+        else:
+            final_candidates = strict_cands
+            
+        if not final_candidates:
+            return None
+            
+        for cand in final_candidates:
             pose = compute_6d_pose(
                 cage_origin=self.processor.cage_origin,
                 row=cand['row'],
@@ -398,19 +412,23 @@ class PackingPlanner:
             }
             
             if cand['stability'].get('will_tilt', False):
-                is_inside, f_pos, f_quat = self.simulator.simulate_tilt(
-                    hm, (item_L, item_W, item_H), pose['position'], pose['quaternion']
-                )
-                if not is_inside:
-                    continue  # fallback to next candidate
-                
-                rot = Rotation.from_quat(f_quat)
-                result['simulated_pose'] = {
-                    'position': f_pos,
-                    'quaternion': f_quat,
-                    'rotation_matrix': rot.as_matrix(),
-                    'orientation_euler': rot.as_euler('XYZ')
-                }
+                if ENABLE_MUJOCO_SIMULATION:
+                    is_inside, f_pos, f_quat = self.simulator.simulate_tilt(
+                        hm, (item_L, item_W, item_H), pose['position'], pose['quaternion']
+                    )
+                    if not is_inside:
+                        continue  # 物理验证失败，滑出笼子，回退到下一个候选
+                    
+                    rot = Rotation.from_quat(f_quat)
+                    result['simulated_pose'] = {
+                        'position': f_pos,
+                        'quaternion': f_quat,
+                        'rotation_matrix': rot.as_matrix(),
+                        'orientation_euler': rot.as_euler('XYZ')
+                    }
+                else:
+                    # 正式环境下不仿真，直接放行，但保留原始位姿作为目标
+                    result['simulated_pose'] = None
             
             self.placed_items.append({
                 'dimensions': (item_L, item_W, item_H),

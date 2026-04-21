@@ -69,7 +69,8 @@ class StabilityChecker:
             'tilt_roll': 0.0,
             'tilt_pitch': 0.0,
             'reason': '',
-            'will_tilt': False
+            'will_tilt': False,
+            'stability_level': 'STRICT' # 'STRICT' | 'PLUS' | 'INVALID'
         }
         
         rows, cols = heightmap_region.shape
@@ -77,6 +78,7 @@ class StabilityChecker:
         
         if total_cells == 0:
             result['is_stable'] = False
+            result['stability_level'] = 'INVALID'
             result['reason'] = '底面面积为零'
             return result
         
@@ -95,11 +97,15 @@ class StabilityChecker:
         if support_ratio < self.min_support_ratio:
             if not TRY_PLUS_PACKING:
                 result['is_stable'] = False
+                result['stability_level'] = 'INVALID'
                 result['reason'] = f'支撑面积不足: {support_ratio:.1%} < {self.min_support_ratio:.1%}'
                 return result
             else:
+                result['stability_level'] = 'PLUS' # 降级为 Plus
+                
                 if support_ratio <= 0.01:
                     result['is_stable'] = False
+                    result['stability_level'] = 'INVALID'
                     result['reason'] = 'Plus策略: 支撑面积太小(<1%)，极不稳定'
                     return result
                 # 检查里外偏心严重时的 Y 向支撑深度率
@@ -111,6 +117,7 @@ class StabilityChecker:
                         support_length_y_ratio = (y_max - y_min + 1) / rows
                         if support_length_y_ratio < MIN_SUPPORT_LENGTH_RATIO_Y:
                             result['is_stable'] = False
+                            result['stability_level'] = 'INVALID'
                             result['reason'] = f'Plus策略: 里端支撑且外悬空时支撑深度率({support_length_y_ratio:.1%})不足 {MIN_SUPPORT_LENGTH_RATIO_Y:.1%}'
                             return result
         
@@ -126,6 +133,7 @@ class StabilityChecker:
         
         if tilt_angle > self.max_tilt_angle_rad:
             result['is_stable'] = False
+            result['stability_level'] = 'INVALID'
             result['reason'] = f'底面倾斜过大: {np.rad2deg(tilt_angle):.1f}° > {np.rad2deg(self.max_tilt_angle_rad):.1f}°'
             return result
         
@@ -139,8 +147,10 @@ class StabilityChecker:
         if not is_cog_stable:
             if TRY_PLUS_PACKING:
                 result['will_tilt'] = True
+                result['stability_level'] = 'PLUS'
             else:
                 result['is_stable'] = False
+                result['stability_level'] = 'INVALID'
                 result['reason'] = cog_reason
                 return result
         
