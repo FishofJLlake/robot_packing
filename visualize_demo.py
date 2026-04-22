@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import matplotlib.gridspec as gridspec
+from matplotlib import font_manager
 from matplotlib.patches import Rectangle, FancyBboxPatch
 import os
 
@@ -19,6 +20,28 @@ from point_cloud_processor import PointCloudProcessor
 from stability_checker import StabilityChecker
 from packing_planner import PackingPlanner
 from pose_generator import format_pose_string
+
+
+def _configure_matplotlib_fonts():
+    """Configure matplotlib so Chinese labels render correctly."""
+    candidate_fonts = [
+        "Microsoft YaHei",
+        "SimHei",
+        "Noto Sans CJK SC",
+        "Source Han Sans SC",
+        "WenQuanYi Zen Hei",
+        "Arial Unicode MS",
+    ]
+    available = {font.name for font in font_manager.fontManager.ttflist}
+    selected = [font for font in candidate_fonts if font in available]
+    if selected:
+        plt.rcParams["font.sans-serif"] = selected + list(
+            plt.rcParams.get("font.sans-serif", [])
+        )
+    plt.rcParams["axes.unicode_minus"] = False
+
+
+_configure_matplotlib_fonts()
 
 
 # ─── 颜色方案（更美观的配色） ───

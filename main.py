@@ -28,6 +28,7 @@ from packing_planner import PackingPlanner
 from pose_generator import format_pose_string
 from visualizer import (
     visualize_heightmap,
+    visualize_fitted_heightmap,
     visualize_packing_2d,
     visualize_packing_3d,
 )
@@ -246,6 +247,14 @@ def run_demo_ply(ply_path: str, xy_only: bool = False, seed: Optional[int] = Non
     print(f"  有效覆盖率: {np.mean(planner.valid_mask):.1%}")
     
     visualize_heightmap(planner.heightmap, title="PLY 初始高度图")
+    if (planner.processor.latest_raw_heightmap is not None and
+            planner.processor.latest_fitted_heightmap is not None):
+        visualize_fitted_heightmap(
+            planner.processor.latest_raw_heightmap,
+            planner.processor.latest_fitted_heightmap,
+            planner.processor.latest_plane_label_map,
+            title="PLY 初始高度图拟合结果"
+        )
     
     # 在已有高度图基础上放置新物品
     items = [

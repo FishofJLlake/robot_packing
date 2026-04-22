@@ -8,7 +8,15 @@ import os
 # 确保项目根目录在路径中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import get_orientations, CAGE_WIDTH, CAGE_LENGTH, CAGE_HEIGHT, HEIGHTMAP_RESOLUTION
+from config import (
+    get_orientations,
+    CAGE_WIDTH,
+    CAGE_LENGTH,
+    CAGE_HEIGHT,
+    HEIGHTMAP_RESOLUTION,
+    PLANE_HEIGHT_DIFF_THRESHOLD,
+    PLANE_SMALL_REGION_MAX_CELLS,
+)
 from point_cloud_processor import PointCloudProcessor
 from stability_checker import StabilityChecker
 from packing_planner import PackingPlanner
@@ -130,6 +138,138 @@ def test_heightmap_generation():
     assert hm_p90[cell_r, cell_c] >= hm_med[cell_r, cell_c], "p90 应 >= median"
     
     print("  ✅ 高度图生成测试通过\n")
+
+
+def test_local_plane_fitting_on_heightmap():
+    """Test whole-heightmap local plane fitting."""
+    print("=== Test Local Plane Fitting On Heightmap ===")
+
+    processor = PointCloudProcessor(
+        cage_origin=(0, 0, 0),
+        cage_width=0.5,
+        cage_length=0.5,
+        cage_height=0.5,
+        resolution=0.01,
+    )
+
+    rows, cols = 20, 20
+    grid_rows, grid_cols = np.mgrid[0:rows, 0:cols]
+    ground_truth = 0.20 + grid_cols * 0.0015 + grid_rows * 0.0010
+
+    rng = np.random.default_rng(0)
+    noisy_heightmap = ground_truth + rng.normal(0.0, 0.0025, size=ground_truth.shape)
+    noisy_heightmap[6, 7] += 0.012
+    valid_mask = np.ones_like(noisy_heightmap, dtype=bool)
+
+    fitted_heightmap, plane_label_map = processor._fit_local_planes_from_heightmap(
+        noisy_heightmap, valid_mask
+    )
+
+    raw_rmse = np.sqrt(np.mean((noisy_heightmap - ground_truth) ** 2))
+    fitted_rmse = np.sqrt(np.mean((fitted_heightmap - ground_truth) ** 2))
+    unique_labels = np.unique(plane_label_map[plane_label_map >= 0])
+
+    print(f"  raw_rmse={raw_rmse:.5f}, fitted_rmse={fitted_rmse:.5f}")
+    print(f"  unique plane labels={len(unique_labels)}")
+
+    assert fitted_rmse < raw_rmse, "拟合后 RMSE 应低于原始噪声高度图"
+    assert len(unique_labels) == 1, "连续斜平面应被识别为一个局部平面"
+
+    print("  PASS local plane fitting test\n")
+
+
+def test_plane_label_map_splits_step_surface():
+    """Test that step surfaces are split into multiple plane labels."""
+    print("=== Test Plane Label Map Splits Step Surface ===")
+
+    processor = PointCloudProcessor(
+        cage_origin=(0, 0, 0),
+        cage_width=0.5,
+        cage_length=0.5,
+        cage_height=0.5,
+        resolution=0.01,
+    )
+
+    heightmap = np.ones((16, 16), dtype=np.float64) * 0.20
+    heightmap[:, 8:] += PLANE_HEIGHT_DIFF_THRESHOLD + 0.03
+    valid_mask = np.ones_like(heightmap, dtype=bool)
+
+    fitted_heightmap, plane_label_map = processor._fit_local_planes_from_heightmap(
+        heightmap, valid_mask
+    )
+    unique_labels = np.unique(plane_label_map[plane_label_map >= 0])
+
+    print(f"  unique plane labels={len(unique_labels)}")
+    assert len(unique_labels) >= 2, "明显台阶应被切分为至少两个局部平面"
+    assert np.allclose(fitted_heightmap[:, :8], 0.20), "左侧平面高度应保持稳定"
+    assert np.allclose(
+        fitted_heightmap[:, 8:], 0.20 + PLANE_HEIGHT_DIFF_THRESHOLD + 0.03
+    ), "右侧平面高度应保持稳定"
+
+    print("  PASS step surface split test\n")
+
+
+def test_small_plane_region_is_merged():
+    """Test that very small isolated regions are merged into surrounding planes."""
+    print("=== Test Small Plane Region Is Merged ===")
+
+    processor = PointCloudProcessor(
+        cage_origin=(0, 0, 0),
+        cage_width=0.5,
+        cage_length=0.5,
+        cage_height=0.5,
+        resolution=0.01,
+    )
+
+    heightmap = np.ones((20, 20), dtype=np.float64) * 0.20
+    island_size = min(2, max(1, int(np.sqrt(PLANE_SMALL_REGION_MAX_CELLS))))
+    heightmap[9:9 + island_size, 9:9 + island_size] += PLANE_HEIGHT_DIFF_THRESHOLD + 0.01
+    valid_mask = np.ones_like(heightmap, dtype=bool)
+
+    fitted_heightmap, plane_label_map = processor._fit_local_planes_from_heightmap(
+        heightmap, valid_mask
+    )
+    unique_labels = np.unique(plane_label_map[plane_label_map >= 0])
+    island = fitted_heightmap[9:9 + island_size, 9:9 + island_size]
+
+    print(f"  unique plane labels={len(unique_labels)}")
+    print(f"  island mean after merge={np.mean(island):.4f}")
+
+    assert len(unique_labels) == 1, "小孤岛区域应被并回周围大平面"
+    assert np.allclose(island, 0.20, atol=1e-3), "小区域应被削平到周围主平面高度"
+
+    print("  PASS small region merge test\n")
+
+
+def test_planner_updates_with_fitted_heightmap():
+    """Test planner caches fitted/raw heightmaps and plane labels."""
+    print("=== Test Planner Uses Fitted Heightmap ===")
+
+    processor = PointCloudProcessor(
+        cage_origin=(0, 0, 0),
+        cage_width=0.5,
+        cage_length=0.5,
+        cage_height=0.5,
+        resolution=0.01,
+    )
+    planner = PackingPlanner(processor, StabilityChecker())
+
+    rng = np.random.default_rng(1)
+    xs = rng.uniform(0.05, 0.35, 1200)
+    ys = rng.uniform(0.05, 0.35, 1200)
+    zs = 0.15 + 0.02 * xs + 0.01 * ys + rng.normal(0.0, 0.002, size=1200)
+    points = np.column_stack([xs, ys, zs])
+
+    planner.update_heightmap_from_pointcloud(points)
+
+    assert processor.latest_raw_heightmap is not None
+    assert processor.latest_fitted_heightmap is not None
+    assert processor.latest_plane_label_map is not None
+    assert np.array_equal(planner.heightmap, processor.latest_fitted_heightmap)
+    assert np.array_equal(planner.raw_heightmap, processor.latest_raw_heightmap)
+    assert np.array_equal(planner.plane_label_map, processor.latest_plane_label_map)
+
+    print("  PASS planner fitted heightmap update test\n")
 
 
 def test_stability_checker():
@@ -414,6 +554,10 @@ def run_all_tests():
     test_orientations()
     test_orientations_xy_only()
     test_heightmap_generation()
+    test_local_plane_fitting_on_heightmap()
+    test_plane_label_map_splits_step_surface()
+    test_small_plane_region_is_merged()
+    test_planner_updates_with_fitted_heightmap()
     test_stability_checker()
     test_pose_generation()
     test_packing_planner_empty_cage()

@@ -7,6 +7,8 @@
   3. 高度图聚合支持 max / median / p90
   4. valid_mask 区分"无点"与"真实低高度"，滤波仅作用于有效区域
 """
+from collections import deque
+
 import numpy as np
 from typing import Tuple, Optional
 import scipy.ndimage as ndimage
@@ -27,6 +29,8 @@ from config import (
     STATISTICAL_OUTLIER_STD_RATIO,
     HEIGHTMAP_AGGREGATION,
     PLY_CROP_X, PLY_CROP_Y, PLY_CROP_Z,
+    PLANE_HEIGHT_DIFF_THRESHOLD,
+    PLANE_SMALL_REGION_MAX_CELLS,
 )
 
 
@@ -73,6 +77,9 @@ class PointCloudProcessor:
         # 记录最新处理的点云数据用于外部3D可视化叠加
         self.latest_points: Optional[np.ndarray] = None
         self.latest_colors: Optional[np.ndarray] = None
+        self.latest_raw_heightmap: Optional[np.ndarray] = None
+        self.latest_fitted_heightmap: Optional[np.ndarray] = None
+        self.latest_plane_label_map: Optional[np.ndarray] = None
         
         # 计算高度图尺寸
         self.grid_cols = int(np.ceil(cage_width  / resolution))  # X方向格数
@@ -358,6 +365,227 @@ class PointCloudProcessor:
         
         return out
 
+    def _fit_local_planes_from_heightmap(self,
+                                         heightmap: np.ndarray,
+                                         valid_mask: np.ndarray
+                                         ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Fit local planes on the whole heightmap and return a smoother planning
+        heightmap plus a plane label map.
+        """
+        fitted_heightmap = heightmap.copy()
+        plane_label_map = np.full(heightmap.shape, -1, dtype=np.int32)
+
+        if not np.any(valid_mask):
+            return fitted_heightmap, plane_label_map
+
+        assigned_mask = np.zeros_like(valid_mask, dtype=bool)
+        tolerance = float(PLANE_HEIGHT_DIFF_THRESHOLD)
+        plane_id = 0
+
+        for row in range(heightmap.shape[0]):
+            for col in range(heightmap.shape[1]):
+                if not valid_mask[row, col] or assigned_mask[row, col]:
+                    continue
+
+                component = self._collect_plane_component(
+                    heightmap, valid_mask, assigned_mask, row, col, tolerance
+                )
+                if not component:
+                    continue
+
+                comp_rows = np.array([r for r, _ in component], dtype=np.int32)
+                comp_cols = np.array([c for _, c in component], dtype=np.int32)
+
+                fitted_values = self._fit_plane_component(heightmap, comp_rows, comp_cols)
+                if fitted_values is None:
+                    plane_label_map[comp_rows, comp_cols] = plane_id
+                    assigned_mask[comp_rows, comp_cols] = True
+                    plane_id += 1
+                    continue
+
+                residuals = np.abs(fitted_values - heightmap[comp_rows, comp_cols])
+                inlier_mask = residuals <= tolerance
+
+                if np.sum(inlier_mask) >= 3:
+                    inlier_rows = comp_rows[inlier_mask]
+                    inlier_cols = comp_cols[inlier_mask]
+                    plane_label_map[inlier_rows, inlier_cols] = plane_id
+                    fitted_heightmap[inlier_rows, inlier_cols] = fitted_values[inlier_mask]
+                    assigned_mask[inlier_rows, inlier_cols] = True
+                    plane_id += 1
+                else:
+                    plane_label_map[comp_rows, comp_cols] = plane_id
+                    assigned_mask[comp_rows, comp_cols] = True
+                    plane_id += 1
+
+        fitted_heightmap, plane_label_map = self._merge_small_plane_regions(
+            fitted_heightmap, plane_label_map, valid_mask
+        )
+        return fitted_heightmap, plane_label_map
+
+    @staticmethod
+    def _collect_plane_component(heightmap: np.ndarray,
+                                 valid_mask: np.ndarray,
+                                 assigned_mask: np.ndarray,
+                                 start_row: int,
+                                 start_col: int,
+                                 tolerance: float):
+        """Collect one local height-consistent component."""
+        component = []
+        seen = np.zeros_like(valid_mask, dtype=bool)
+        queue = deque([(start_row, start_col)])
+        seen[start_row, start_col] = True
+
+        while queue:
+            row, col = queue.popleft()
+            component.append((row, col))
+            base_height = heightmap[row, col]
+
+            for d_row, d_col in (
+                (1, 0), (-1, 0), (0, 1), (0, -1),
+                (1, 1), (1, -1), (-1, 1), (-1, -1)
+            ):
+                next_row = row + d_row
+                next_col = col + d_col
+
+                if (next_row < 0 or next_row >= heightmap.shape[0] or
+                        next_col < 0 or next_col >= heightmap.shape[1]):
+                    continue
+                if seen[next_row, next_col] or assigned_mask[next_row, next_col]:
+                    continue
+                if not valid_mask[next_row, next_col]:
+                    continue
+                if abs(heightmap[next_row, next_col] - base_height) > tolerance:
+                    continue
+
+                seen[next_row, next_col] = True
+                queue.append((next_row, next_col))
+
+        return component
+
+    def _fit_plane_component(self,
+                             heightmap: np.ndarray,
+                             comp_rows: np.ndarray,
+                             comp_cols: np.ndarray) -> Optional[np.ndarray]:
+        """Fit z = ax + by + c for one connected component."""
+        if comp_rows.size < 3:
+            return None
+
+        xs = comp_cols.astype(np.float64) * self.resolution
+        ys = comp_rows.astype(np.float64) * self.resolution
+        zs = heightmap[comp_rows, comp_cols]
+        design = np.column_stack([xs, ys, np.ones_like(xs)])
+
+        try:
+            coeffs, _, rank, _ = np.linalg.lstsq(design, zs, rcond=None)
+        except np.linalg.LinAlgError:
+            return None
+
+        if rank < 3:
+            return None
+
+        return design @ coeffs
+
+    def _merge_small_plane_regions(self,
+                                   fitted_heightmap: np.ndarray,
+                                   plane_label_map: np.ndarray,
+                                   valid_mask: np.ndarray
+                                   ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Merge very small isolated plane regions into surrounding larger planes.
+        """
+        max_small_region_cells = int(PLANE_SMALL_REGION_MAX_CELLS)
+        if max_small_region_cells <= 0:
+            return fitted_heightmap, plane_label_map
+
+        labels = plane_label_map[plane_label_map >= 0]
+        if labels.size == 0:
+            return fitted_heightmap, plane_label_map
+
+        label_counts = {
+            int(label): int(np.sum(plane_label_map == label))
+            for label in np.unique(labels)
+        }
+
+        for label, count in sorted(label_counts.items(), key=lambda item: item[1]):
+            if count > max_small_region_cells:
+                continue
+
+            region_rows, region_cols = np.where(plane_label_map == label)
+            if region_rows.size == 0:
+                continue
+
+            neighbor_votes = {}
+            for row, col in zip(region_rows, region_cols):
+                for d_row, d_col in (
+                    (1, 0), (-1, 0), (0, 1), (0, -1),
+                    (1, 1), (1, -1), (-1, 1), (-1, -1)
+                ):
+                    next_row = row + d_row
+                    next_col = col + d_col
+                    if (next_row < 0 or next_row >= plane_label_map.shape[0] or
+                            next_col < 0 or next_col >= plane_label_map.shape[1]):
+                        continue
+                    if not valid_mask[next_row, next_col]:
+                        continue
+
+                    neighbor_label = int(plane_label_map[next_row, next_col])
+                    if neighbor_label < 0 or neighbor_label == label:
+                        continue
+
+                    neighbor_votes[neighbor_label] = neighbor_votes.get(neighbor_label, 0) + 1
+
+            if not neighbor_votes:
+                continue
+
+            target_label = max(
+                neighbor_votes,
+                key=lambda candidate: (neighbor_votes[candidate], label_counts.get(candidate, 0))
+            )
+            target_rows, target_cols = np.where(plane_label_map == target_label)
+            target_fit = self._fit_plane_component(
+                fitted_heightmap, target_rows.astype(np.int32), target_cols.astype(np.int32)
+            )
+            if target_fit is not None:
+                xs = region_cols.astype(np.float64) * self.resolution
+                ys = region_rows.astype(np.float64) * self.resolution
+                design = np.column_stack([xs, ys, np.ones_like(xs)])
+                coeffs, _, rank, _ = np.linalg.lstsq(
+                    np.column_stack([
+                        target_cols.astype(np.float64) * self.resolution,
+                        target_rows.astype(np.float64) * self.resolution,
+                        np.ones_like(target_rows, dtype=np.float64),
+                    ]),
+                    fitted_heightmap[target_rows, target_cols],
+                    rcond=None,
+                )
+                if rank >= 3:
+                    fitted_heightmap[region_rows, region_cols] = design @ coeffs
+                else:
+                    fitted_heightmap[region_rows, region_cols] = np.median(
+                        fitted_heightmap[target_rows, target_cols]
+                    )
+            else:
+                fitted_heightmap[region_rows, region_cols] = np.median(
+                    fitted_heightmap[target_rows, target_cols]
+                )
+
+            plane_label_map[region_rows, region_cols] = target_label
+            label_counts[target_label] = label_counts.get(target_label, 0) + count
+            label_counts[label] = 0
+
+        return fitted_heightmap, plane_label_map
+
+    def _cache_heightmap_artifacts(self,
+                                   raw_heightmap: np.ndarray,
+                                   fitted_heightmap: np.ndarray,
+                                   plane_label_map: np.ndarray):
+        """Cache raw/fitted heightmap artifacts for downstream modules."""
+        self.latest_raw_heightmap = raw_heightmap.copy()
+        self.latest_fitted_heightmap = fitted_heightmap.copy()
+        self.latest_plane_label_map = plane_label_map.copy()
+
     def generate_heightmap_from_raw(self,
                                      raw_points: np.ndarray,
                                      is_real: bool = False,
@@ -367,7 +595,14 @@ class PointCloudProcessor:
         一步完成：点云数据 → 预处理(融合裁剪/去噪) → 对齐高度图 + valid_mask。
         """
         processed, _ = self.preprocess_point_cloud(raw_points, is_real=is_real)
-        return self.generate_heightmap(processed, is_real=is_real, aggregation=aggregation)
+        raw_heightmap, valid_mask = self.generate_heightmap(
+            processed, is_real=is_real, aggregation=aggregation
+        )
+        fitted_heightmap, plane_label_map = self._fit_local_planes_from_heightmap(
+            raw_heightmap, valid_mask
+        )
+        self._cache_heightmap_artifacts(raw_heightmap, fitted_heightmap, plane_label_map)
+        return fitted_heightmap, valid_mask
 
     # ------------------------------------------------------------------
     # PLY 文件读取
@@ -461,7 +696,13 @@ class PointCloudProcessor:
             PointCloudProcessor._visualize_with_axes(pcd_proc, title=f"Cropped & Processed PLY - {os.path.basename(ply_path)}")
             
         # 生成高度图 (这步同时会锁定新装箱原点、缩放配置)
-        heightmap, valid_mask = self.generate_heightmap(processed_pts, is_real=True, aggregation=aggregation)
+        raw_heightmap, valid_mask = self.generate_heightmap(
+            processed_pts, is_real=True, aggregation=aggregation
+        )
+        fitted_heightmap, plane_label_map = self._fit_local_planes_from_heightmap(
+            raw_heightmap, valid_mask
+        )
+        self._cache_heightmap_artifacts(raw_heightmap, fitted_heightmap, plane_label_map)
         
         # 将发往 3D 结果总视图的散点坐标进行刚体平移对齐，与规划器里的笼子(0,0,0)原点相认
         aligned_pts = np.copy(processed_pts)
@@ -474,7 +715,7 @@ class PointCloudProcessor:
         self.latest_points = aligned_pts
         self.latest_colors = processed_cls
         
-        return heightmap, valid_mask
+        return fitted_heightmap, valid_mask
 
     # ------------------------------------------------------------------
     # 兼容接口：返回仅高度图（不含 mask）

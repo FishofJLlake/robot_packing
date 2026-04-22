@@ -81,8 +81,12 @@ class PackingPlanner:
         self.heightmap = np.zeros(
             (processor.grid_rows, processor.grid_cols), dtype=np.float64
         )
+        self.raw_heightmap = self.heightmap.copy()
         self.valid_mask = np.zeros(
             (processor.grid_rows, processor.grid_cols), dtype=bool
+        )
+        self.plane_label_map = np.full(
+            (processor.grid_rows, processor.grid_cols), -1, dtype=np.int32
         )
         
         # 已放置的货物记录
@@ -97,10 +101,30 @@ class PackingPlanner:
     def update_heightmap_from_pointcloud(self, points: np.ndarray):
         """从新的点云数据更新高度图和有效掩码。"""
         self.heightmap, self.valid_mask = self.processor.generate_heightmap_from_raw(points)
+        self.raw_heightmap = (
+            self.processor.latest_raw_heightmap.copy()
+            if self.processor.latest_raw_heightmap is not None
+            else self.heightmap.copy()
+        )
+        self.plane_label_map = (
+            self.processor.latest_plane_label_map.copy()
+            if self.processor.latest_plane_label_map is not None
+            else np.full(self.heightmap.shape, -1, dtype=np.int32)
+        )
 
     def update_heightmap_from_ply(self, ply_path: str):
         """从 PLY 文件更新高度图和有效掩码。"""
         self.heightmap, self.valid_mask = self.processor.generate_heightmap_from_ply(ply_path)
+        self.raw_heightmap = (
+            self.processor.latest_raw_heightmap.copy()
+            if self.processor.latest_raw_heightmap is not None
+            else self.heightmap.copy()
+        )
+        self.plane_label_map = (
+            self.processor.latest_plane_label_map.copy()
+            if self.processor.latest_plane_label_map is not None
+            else np.full(self.heightmap.shape, -1, dtype=np.int32)
+        )
     
     def update_heightmap_with_placement(self, 
                                          row: int, col: int,
@@ -122,6 +146,10 @@ class PackingPlanner:
             self.heightmap[r_start:r_end, c_start:c_end] = np.maximum(
                 self.heightmap[r_start:r_end, c_start:c_end], new_height
             )
+            self.raw_heightmap[r_start:r_end, c_start:c_end] = np.maximum(
+                self.raw_heightmap[r_start:r_end, c_start:c_end], new_height
+            )
+            self.plane_label_map[r_start:r_end, c_start:c_end] = -1
         else:
             new_height = place_height + item_up
             r_end = min(row + item_rows, self.processor.grid_rows)
@@ -129,6 +157,10 @@ class PackingPlanner:
             self.heightmap[row:r_end, col:c_end] = np.maximum(
                 self.heightmap[row:r_end, col:c_end], new_height
             )
+            self.raw_heightmap[row:r_end, col:c_end] = np.maximum(
+                self.raw_heightmap[row:r_end, col:c_end], new_height
+            )
+            self.plane_label_map[row:r_end, col:c_end] = -1
     
     # ------------------------------------------------------------------
     # 填充状态评估
