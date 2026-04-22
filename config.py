@@ -27,9 +27,9 @@ PLACEMENT_GAP = 0.02          # 1 cm 间隙，方便实际放置
 PLY_FILE_PATH = None
 # 真实点云裁剪范围 (单位与点云文件自身一致)
 # 格式为 (min_val, max_val)。如果没有限制则用 None
-PLY_CROP_X = (-0.88, -0.06)
+PLY_CROP_X = (-0.88, -0.05)
 PLY_CROP_Y = (0.0, 0.45)
-PLY_CROP_Z = (-1.1, 0.00)
+PLY_CROP_Z = (-1.1, -0.20)
 
 # ============================================================
 # XY-only 旋转开关
@@ -52,14 +52,14 @@ OUTER_HEIGHT_CHECK_RATIO = 0.67     # 2/3
 # 开启时: 允许支撑面甚至小于60%。如果发生重心悬空不仅不会被拒绝，还会启用物理引擎模拟倾倒过程；
 # 条件：若是“里侧支撑-外侧悬空”，要求支撑边的深度(Y向)必须占总深度至少 60% 防止滑落。
 TRY_PLUS_PACKING = True
-MIN_SUPPORT_LENGTH_RATIO_Y = 0.60
+MIN_SUPPORT_LENGTH_RATIO_Y = 0.52
 # 测试环境下为 True（物理验证倾覆后不漏出笼子），生产环境下设为 False 直接放行 Plus 方案
 ENABLE_MUJOCO_SIMULATION = False
 
 # ============================================================
 # 稳定性阈值
 # ============================================================
-MIN_SUPPORT_RATIO = 0.50      # 底部至少 60% 面积有支撑
+MIN_SUPPORT_RATIO = 0.55      # 底部至少 60% 面积有支撑
 MAX_TILT_ANGLE    = 10.0       # 最大允许倾斜角度（度）
 SUPPORT_HEIGHT_TOLERANCE = 0.02  # 支撑高度容差 超参数：平面阈值，比如 2cm 内起伏皆视为支撑平面
 

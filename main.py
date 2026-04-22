@@ -262,7 +262,6 @@ def run_demo_ply(ply_path: str, xy_only: bool = False, seed: Optional[int] = Non
     print(f"  最大高度: {np.max(planner.heightmap):.3f} m")
     print(f"  有效覆盖率: {np.mean(planner.valid_mask):.1%}")
     
-    visualize_heightmap(planner.heightmap, title="PLY 初始高度图")
     if (planner.processor.latest_raw_heightmap is not None and
             planner.processor.latest_fitted_heightmap is not None):
         visualize_fitted_heightmap(

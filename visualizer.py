@@ -304,8 +304,8 @@ def visualize_packing_3d(cage_origin: Tuple[float, float, float],
         result = item["result"]
         pose = result["pose"]
         orientation = result["orientation"]
-        base_x, base_y = orientation["base_dims"]
         up_dim = orientation["up_dim"]
+        orig_l, orig_w, orig_h = item["dimensions"]
         center = np.array(pose["position"])
         color = COLORS[i % len(COLORS)]
 
@@ -322,11 +322,11 @@ def visualize_packing_3d(cage_origin: Tuple[float, float, float],
             mesh.translate(simulated_pose["position"])
         else:
             mesh = o3d.geometry.TriangleMesh.create_box(
-                width=base_x,
-                height=base_y,
-                depth=up_dim,
+                width=orig_l,
+                height=orig_w,
+                depth=orig_h,
             )
-            mesh.translate([-base_x / 2, -base_y / 2, -up_dim / 2])
+            mesh.translate([-orig_l / 2, -orig_w / 2, -orig_h / 2])
             mesh.rotate(pose["rotation_matrix"], center=np.zeros(3))
             mesh.translate(center)
 
