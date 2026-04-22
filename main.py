@@ -14,7 +14,8 @@
 import numpy as np
 import sys
 import argparse
-from typing import List, Tuple
+import random
+from typing import List, Optional, Tuple
 
 from config import (
     CAGE_WIDTH, CAGE_LENGTH, CAGE_HEIGHT,
@@ -217,7 +218,7 @@ def run_demo(xy_only=False):
     return planner
 
 
-def run_demo_ply(ply_path: str, xy_only: bool = False):
+def run_demo_ply(ply_path: str, xy_only: bool = False, seed: Optional[int] = None):
     """
     PLY 文件模式演示：从真实点云加载初始笼内状态，在此基础上放置新物品。
     
@@ -246,8 +247,6 @@ def run_demo_ply(ply_path: str, xy_only: bool = False):
     
     visualize_heightmap(planner.heightmap, title="PLY 初始高度图")
     
-    import random
-    
     # 在已有高度图基础上放置新物品
     items = [
         (0.395, 0.310, 0.205),  # apriltag 1
@@ -260,7 +259,13 @@ def run_demo_ply(ply_path: str, xy_only: bool = False):
         (0.420, 0.410, 0.330),  # apriltag 8
     ]
     # 打乱包裹顺序模拟随机来料
-    random.shuffle(items)
+    effective_seed = seed if seed is not None else random.randrange(0, 2**32)
+    rng = random.Random(effective_seed)
+    rng.shuffle(items)
+    if seed is None:
+        print(f"Using random seed: {effective_seed} (auto-generated)")
+    else:
+        print(f"Using random seed: {effective_seed}")
     
     print(f"\n在PLY初始状态上放置 {len(items)} 个新物品...")
     results = simulate_packing(planner, items, verbose=True)
@@ -405,6 +410,8 @@ def parse_args():
                         help='启用仅XY旋转模式（物体底面朝下，绕Z轴旋转0°/90°）')
     parser.add_argument('--uneven', action='store_true', default=False,
                         help='运行不平底面装箱演示')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed for reproducible shuffling in PLY mode.')
     parser.add_argument('--visualize-mujoco', action='store_true', default=False,
                         help='在终端输出后启动高级 MuJoCo 3D物理模拟 Viewer 来还原下落堆垛全过程')
     return parser.parse_args()
@@ -417,7 +424,7 @@ def main():
     if args.uneven:
         planner = run_demo_uneven_surface(xy_only=args.xy_only)
     elif args.ply:
-        planner = run_demo_ply(args.ply, xy_only=args.xy_only)
+        planner = run_demo_ply(args.ply, xy_only=args.xy_only, seed=args.seed)
     else:
         planner = run_demo(xy_only=args.xy_only)
         
