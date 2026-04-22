@@ -31,6 +31,10 @@ from config import (
     PLY_CROP_X, PLY_CROP_Y, PLY_CROP_Z,
     PLANE_HEIGHT_DIFF_THRESHOLD,
     PLANE_SMALL_REGION_MAX_CELLS,
+    PLANE_FIT_REPLACE_MAX_TILT_DEG,
+    PLANE_FIT_MAX_RMSE,
+    PLANE_FIT_MIN_CELLS,
+    PLANE_FIT_SLOPE_BLEND_ALPHA,
 )
 
 
@@ -323,7 +327,7 @@ class PointCloudProcessor:
 
         # ---- 对有效区域做中值滤波（平滑深度相机飞点）----
         # 只对 valid_mask=True 的区域滤波，无数据区域保持 0
-        heightmap = self._masked_median_filter(heightmap, valid_mask, size=3)
+        # heightmap = self._masked_median_filter(heightmap, valid_mask, size=3)
         
         return heightmap, valid_mask
 
@@ -381,6 +385,10 @@ class PointCloudProcessor:
 
         assigned_mask = np.zeros_like(valid_mask, dtype=bool)
         tolerance = float(PLANE_HEIGHT_DIFF_THRESHOLD)
+        max_tilt_deg = float(PLANE_FIT_REPLACE_MAX_TILT_DEG)
+        max_rmse = float(PLANE_FIT_MAX_RMSE)
+        min_cells = int(PLANE_FIT_MIN_CELLS)
+        slope_blend_alpha = float(np.clip(PLANE_FIT_SLOPE_BLEND_ALPHA, 0.0, 1.0))
         plane_id = 0
 
         for row in range(heightmap.shape[0]):
@@ -397,27 +405,42 @@ class PointCloudProcessor:
                 comp_rows = np.array([r for r, _ in component], dtype=np.int32)
                 comp_cols = np.array([c for _, c in component], dtype=np.int32)
 
-                fitted_values = self._fit_plane_component(heightmap, comp_rows, comp_cols)
-                if fitted_values is None:
-                    plane_label_map[comp_rows, comp_cols] = plane_id
+                fit_result = self._fit_plane_component_with_metrics(
+                    heightmap, comp_rows, comp_cols
+                )
+                if fit_result is None:
                     assigned_mask[comp_rows, comp_cols] = True
-                    plane_id += 1
                     continue
+                fitted_values, _, tilt_deg, rmse = fit_result
 
                 residuals = np.abs(fitted_values - heightmap[comp_rows, comp_cols])
                 inlier_mask = residuals <= tolerance
+                is_fit_candidate = (
+                    comp_rows.size >= min_cells and
+                    rmse <= max_rmse
+                )
 
-                if np.sum(inlier_mask) >= 3:
+                if is_fit_candidate and np.sum(inlier_mask) >= 3:
                     inlier_rows = comp_rows[inlier_mask]
                     inlier_cols = comp_cols[inlier_mask]
                     plane_label_map[inlier_rows, inlier_cols] = plane_id
-                    fitted_heightmap[inlier_rows, inlier_cols] = fitted_values[inlier_mask]
+
+                    if tilt_deg <= max_tilt_deg:
+                        # 低倾角：按拟合值替换，优先去噪和平整局部小波纹
+                        fitted_heightmap[inlier_rows, inlier_cols] = fitted_values[inlier_mask]
+                    else:
+                        # 高倾角：采用弱拟合，保留原始渐变趋势，避免过度拉平
+                        raw_vals = heightmap[inlier_rows, inlier_cols]
+                        fitted_heightmap[inlier_rows, inlier_cols] = (
+                            (1.0 - slope_blend_alpha) * raw_vals +
+                            slope_blend_alpha * fitted_values[inlier_mask]
+                        )
                     assigned_mask[inlier_rows, inlier_cols] = True
                     plane_id += 1
                 else:
-                    plane_label_map[comp_rows, comp_cols] = plane_id
+                    # Rejected fit candidate: keep original heights unchanged.
+                    # Skip plane labels here to avoid downstream merge rewriting.
                     assigned_mask[comp_rows, comp_cols] = True
-                    plane_id += 1
 
         fitted_heightmap, plane_label_map = self._merge_small_plane_regions(
             fitted_heightmap, plane_label_map, valid_mask
@@ -469,6 +492,24 @@ class PointCloudProcessor:
                              comp_rows: np.ndarray,
                              comp_cols: np.ndarray) -> Optional[np.ndarray]:
         """Fit z = ax + by + c for one connected component."""
+        fit_result = self._fit_plane_component_with_metrics(heightmap, comp_rows, comp_cols)
+        if fit_result is None:
+            return None
+        fitted_values, _, _, _ = fit_result
+        return fitted_values
+
+    def _fit_plane_component_with_metrics(self,
+                                          heightmap: np.ndarray,
+                                          comp_rows: np.ndarray,
+                                          comp_cols: np.ndarray
+                                          ) -> Optional[Tuple[np.ndarray, np.ndarray, float, float]]:
+        """
+        Fit z = ax + by + c for one connected component.
+
+        Returns
+        -------
+        (fitted_values, coeffs, tilt_deg, rmse) or None
+        """
         if comp_rows.size < 3:
             return None
 
@@ -485,7 +526,15 @@ class PointCloudProcessor:
         if rank < 3:
             return None
 
-        return design @ coeffs
+        fitted_values = design @ coeffs
+        residuals = fitted_values - zs
+        rmse = float(np.sqrt(np.mean(residuals ** 2)))
+
+        a, b = float(coeffs[0]), float(coeffs[1])
+        tilt_rad = np.arctan(np.sqrt(a * a + b * b))
+        tilt_deg = float(np.rad2deg(tilt_rad))
+
+        return fitted_values, coeffs, tilt_deg, rmse
 
     def _merge_small_plane_regions(self,
                                    fitted_heightmap: np.ndarray,

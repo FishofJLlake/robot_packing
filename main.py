@@ -121,6 +121,22 @@ def simulate_packing(planner: PackingPlanner,
         if result is None:
             if verbose:
                 print(f"  ❌ 无法放置！笼内剩余空间不足或无稳定位置。")
+                rej_stats = planner.get_last_rejection_stats()
+                if rej_stats:
+                    print(f"  评估候选数: {rej_stats.get('total_evaluated', 0)}")
+                    print(f"  有效候选数: {rej_stats.get('valid_candidates', 0)}")
+                    print(f"  STRICT/PLUS候选: {rej_stats.get('strict_candidates', 0)}/{rej_stats.get('plus_candidates', 0)}")
+                    print(f"  最终候选数: {rej_stats.get('final_candidates', 0)}")
+                    reasons = rej_stats.get('rejections', {})
+                    top_reasons = sorted(reasons.items(), key=lambda kv: kv[1], reverse=True)
+                    printed = 0
+                    for reason, count in top_reasons:
+                        if count <= 0:
+                            continue
+                        print(f"  拒绝原因[{reason}]: {count}")
+                        printed += 1
+                        if printed >= 6:
+                            break
             continue
         
         # 更新高度图（模拟模式）

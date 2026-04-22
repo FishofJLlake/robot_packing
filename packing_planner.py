@@ -13,7 +13,7 @@
   6. 动态约束松弛（仅外侧高度约束，支撑面积保持严格）
 """
 import numpy as np
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 import math
 
 from config import (
@@ -91,6 +91,7 @@ class PackingPlanner:
         
         # 已放置的货物记录
         self.placed_items = []
+        self.last_rejection_stats: Dict[str, Any] = {}
         
 
     
@@ -289,6 +290,90 @@ class PackingPlanner:
                         candidates.add((r, c))
         
         return candidates
+
+    def _get_gap_cells(self) -> int:
+        """Convert physical placement gap (meters) to grid cells."""
+        if PLACEMENT_GAP <= 0 or self.processor.resolution <= 0:
+            return 0
+        return int(np.ceil(PLACEMENT_GAP / self.processor.resolution))
+
+    def _check_wall_gap(self, row: int, col: int, item_rows: int, item_cols: int, gap_cells: int) -> bool:
+        """Check minimum clearance to cage boundaries."""
+        if gap_cells <= 0:
+            return True
+
+        total_rows, total_cols = self.processor.grid_rows, self.processor.grid_cols
+        # Front side (row=0) is open in this system, so only enforce
+        # clearance to left/right/back physical walls.
+        if col < gap_cells:
+            return False
+        if row + item_rows > total_rows - gap_cells:
+            return False
+        if col + item_cols > total_cols - gap_cells:
+            return False
+        return True
+
+    def _check_item_gap(self,
+                        hm: np.ndarray,
+                        row: int, col: int,
+                        item_rows: int, item_cols: int,
+                        place_height: float,
+                        gap_cells: int) -> bool:
+        """
+        Check minimum clearance to nearby cargo.
+
+        Semantics:
+        - Equivalent to expanding the candidate footprint only to left/right/back
+          (front side is open and not constrained by placement gap).
+        - If any protruding obstacle appears in the expanded zone, reject.
+        """
+        if gap_cells <= 0:
+            return True
+
+        total_rows, total_cols = hm.shape
+        # Expand only to left/right/back (no expansion to front side).
+        r0 = row
+        r1 = min(total_rows, row + item_rows + gap_cells)
+        c0 = max(0, col - gap_cells)
+        c1 = min(total_cols, col + item_cols + gap_cells)
+
+        expanded = hm[r0:r1, c0:c1]
+        if expanded.size == 0:
+            return True
+
+        local_mask = np.zeros_like(expanded, dtype=bool)
+        fr0 = row - r0
+        fr1 = fr0 + item_rows
+        fc0 = col - c0
+        fc1 = fc0 + item_cols
+        local_mask[fr0:fr1, fc0:fc1] = True
+
+        # Expanded zone minus original footprint
+        check_zone = expanded[~local_mask]
+        ring_values = check_zone
+        if ring_values.size == 0:
+            return True
+
+        obstacle_tol = max(PLACEMENT_GAP, 0.01, self.processor.resolution)
+        return bool(np.max(ring_values) <= place_height + obstacle_tol)
+
+    @staticmethod
+    def _empty_rejection_counters() -> Dict[str, int]:
+        return {
+            'orientation_too_large': 0,
+            'wall_gap': 0,
+            'item_gap': 0,
+            'height_limit': 0,
+            'stability': 0,
+            'outer_height': 0,
+            'mujoco_outside': 0,
+            'unknown': 0,
+        }
+
+    @staticmethod
+    def _inc_reason(stats: Dict[str, Any], reason: Optional[str]):
+        reason_key = reason if reason in stats['rejections'] else 'unknown'
+        stats['rejections'][reason_key] += 1
     
     # ------------------------------------------------------------------
     # 核心：放置规划
@@ -322,9 +407,24 @@ class PackingPlanner:
         hm = self.heightmap
         use_xy_only = xy_only if xy_only is not None else self.xy_only
         orientations = get_orientations(item_L, item_W, item_H, xy_only=use_xy_only)
+        self.last_rejection_stats = {
+            'item_dims': (float(item_L), float(item_W), float(item_H)),
+            'xy_only': bool(use_xy_only),
+            'gap_m': float(PLACEMENT_GAP),
+            'gap_cells': 0,
+            'total_evaluated': 0,
+            'valid_candidates': 0,
+            'strict_candidates': 0,
+            'plus_candidates': 0,
+            'final_candidates': 0,
+            'result': 'searching',
+            'rejections': self._empty_rejection_counters(),
+        }
         
         # 获取自适应权重和约束
         adaptive_tol, adaptive_ratio = self._get_adaptive_constraints()
+        gap_cells = self._get_gap_cells()
+        self.last_rejection_stats['gap_cells'] = int(gap_cells)
         
         all_candidates = []
         
@@ -343,32 +443,43 @@ class PackingPlanner:
             max_col = self.processor.grid_cols - item_cols
             
             if max_row < 0 or max_col < 0:
+                self._inc_reason(self.last_rejection_stats, 'orientation_too_large')
                 continue
             
             # ---- 阶段1：粗搜索 ----
             coarse_candidates = []
             for row in range(0, max_row + 1, coarse_step):
                 for col in range(0, max_col + 1, coarse_step):
-                    candidate = self._evaluate_position(
+                    candidate, reject_reason = self._evaluate_position(
                         hm, row, col, item_rows, item_cols,
                         up_dim, base_x, base_y, ori,
-                        adaptive_tol, adaptive_ratio
+                        adaptive_tol, adaptive_ratio, gap_cells,
+                        return_reason=True
                     )
+                    self.last_rejection_stats['total_evaluated'] += 1
                     if candidate is not None:
+                        self.last_rejection_stats['valid_candidates'] += 1
                         coarse_candidates.append(candidate)
+                    else:
+                        self._inc_reason(self.last_rejection_stats, reject_reason)
             
             # ---- 阶段2：天际线候选 ----
             skyline_positions = self._extract_skyline_candidates(
                 hm, item_rows, item_cols, max_row, max_col
             )
             for (row, col) in skyline_positions:
-                candidate = self._evaluate_position(
+                candidate, reject_reason = self._evaluate_position(
                     hm, row, col, item_rows, item_cols,
                     up_dim, base_x, base_y, ori,
-                    adaptive_tol, adaptive_ratio
+                    adaptive_tol, adaptive_ratio, gap_cells,
+                    return_reason=True
                 )
+                self.last_rejection_stats['total_evaluated'] += 1
                 if candidate is not None:
+                    self.last_rejection_stats['valid_candidates'] += 1
                     coarse_candidates.append(candidate)
+                else:
+                    self._inc_reason(self.last_rejection_stats, reject_reason)
             
             coarse_candidates.sort(key=lambda c: c['sort_key'])
             top_n = min(8, len(coarse_candidates))  # 增加精搜区域
@@ -392,19 +503,27 @@ class PackingPlanner:
                                 refined_positions.add((nr, nc))
             
             for (row, col) in refined_positions:
-                candidate = self._evaluate_position(
+                candidate, reject_reason = self._evaluate_position(
                     hm, row, col, item_rows, item_cols,
                     up_dim, base_x, base_y, ori,
-                    adaptive_tol, adaptive_ratio
+                    adaptive_tol, adaptive_ratio, gap_cells,
+                    return_reason=True
                 )
+                self.last_rejection_stats['total_evaluated'] += 1
                 if candidate is not None:
+                    self.last_rejection_stats['valid_candidates'] += 1
                     all_candidates.append(candidate)
+                else:
+                    self._inc_reason(self.last_rejection_stats, reject_reason)
         
         if not all_candidates:
+            self.last_rejection_stats['result'] = 'no_candidates'
             return None
             
         strict_cands = [c for c in all_candidates if c['stability']['stability_level'] == 'STRICT']
         plus_cands = [c for c in all_candidates if c['stability']['stability_level'] == 'PLUS']
+        self.last_rejection_stats['strict_candidates'] = int(len(strict_cands))
+        self.last_rejection_stats['plus_candidates'] = int(len(plus_cands))
         
         strict_cands.sort(key=lambda c: c['sort_key'])
         plus_cands.sort(key=lambda c: c['sort_key'])
@@ -414,8 +533,10 @@ class PackingPlanner:
             final_candidates = strict_cands + plus_cands
         else:
             final_candidates = strict_cands
+        self.last_rejection_stats['final_candidates'] = int(len(final_candidates))
             
         if not final_candidates:
+            self.last_rejection_stats['result'] = 'no_final_candidates'
             return None
             
         for cand in final_candidates:
@@ -449,6 +570,7 @@ class PackingPlanner:
                         hm, (item_L, item_W, item_H), pose['position'], pose['quaternion']
                     )
                     if not is_inside:
+                        self._inc_reason(self.last_rejection_stats, 'mujoco_outside')
                         continue  # 物理验证失败，滑出笼子，回退到下一个候选
                     
                     rot = Rotation.from_quat(f_quat)
@@ -466,9 +588,11 @@ class PackingPlanner:
                 'dimensions': (item_L, item_W, item_H),
                 'result': result,
             })
+            self.last_rejection_stats['result'] = 'success'
             
             return result
             
+        self.last_rejection_stats['result'] = 'all_final_rejected'
         return None
     
     # ------------------------------------------------------------------
@@ -477,29 +601,43 @@ class PackingPlanner:
     
     def _evaluate_position(self, hm, row, col, item_rows, item_cols,
                            up_dim, base_x, base_y, ori,
-                           outer_tol, outer_ratio):
-        """评估单个候选位置，返回候选dict或None(不可行)。"""
+                           outer_tol, outer_ratio, gap_cells,
+                           return_reason: bool = False):
+        """评估单个候选位置，返回候选dict或None；可选返回拒绝原因。"""
+        def _ret(candidate, reason=None):
+            if return_reason:
+                return candidate, reason
+            return candidate
+
+        if not self._check_wall_gap(row, col, item_rows, item_cols, gap_cells):
+            return _ret(None, 'wall_gap')
+
         region = hm[row:row+item_rows, col:col+item_cols]
         place_height = np.max(region)
+
+        if not self._check_item_gap(
+            hm, row, col, item_rows, item_cols, place_height, gap_cells
+        ):
+            return _ret(None, 'item_gap')
         
         # 碰撞检测
         if place_height + up_dim > self.processor.cage_height:
-            return None
+            return _ret(None, 'height_limit')
         
         # 稳定性检测（始终保持严格，不松弛！）
         stability = self.checker.check_stability(
             region, place_height, base_x, base_y
         )
         if not stability['is_stable']:
-            return None
+            return _ret(None, 'stability')
         
         # 外侧高度约束检测（使用自适应阈值）
-        new_top = place_height + up_dim
-        if not self._check_outer_height_constraint(
-            hm, row, col, item_rows, item_cols, new_top,
-            outer_tol, outer_ratio
-        ):
-            return None
+        # new_top = place_height + up_dim
+        # if not self._check_outer_height_constraint(
+        #     hm, row, col, item_rows, item_cols, new_top,
+        #     outer_tol, outer_ratio
+        # ):
+        #     return _ret(None, 'outer_height')
         
         # 提取用于字典序比较的物理特征
         sort_key = self._compute_lexicographical_keys(
@@ -508,13 +646,13 @@ class PackingPlanner:
             base_x=base_x, base_y=base_y
         )
         
-        return {
+        return _ret({
             'row': row, 'col': col,
             'item_rows': item_rows, 'item_cols': item_cols,
             'place_height': place_height, 'up_dim': up_dim,
             'orientation': ori, 'stability': stability,
             'sort_key': sort_key,
-        }
+        }, None)
     
     # ------------------------------------------------------------------
     # 外侧高度约束
@@ -694,7 +832,7 @@ class PackingPlanner:
         corner_dist = dist_y**2 + dist_x**2
         
         # 防止浮点比较异常，圆整 (fit_ratio 保留2位小数做适度分桶)
-        return (-round(float(fit_ratio), 2), round(float(void_volume), 6), -round(float(adjacency), 4), round(float(z_max), 4), round(float(corner_dist), 2))
+        return (-round(float(fit_ratio), 2), round(float(z_max), 4), round(float(void_volume), 6), -round(float(adjacency), 4), round(float(corner_dist), 2))
         
     def _compute_adjacency(self, row, col, item_rows, item_cols, new_top, heightmap):
         """就算物体四周紧贴现有箱体或笼壁的比例，总分为4。"""
@@ -736,6 +874,10 @@ class PackingPlanner:
     # ------------------------------------------------------------------
     # 统计
     # ------------------------------------------------------------------
+
+    def get_last_rejection_stats(self) -> dict:
+        """Return rejection summary from latest plan_placement call."""
+        return dict(self.last_rejection_stats) if self.last_rejection_stats else {}
     
     def get_packing_stats(self) -> dict:
         """返回当前装箱统计信息。"""
